@@ -2,6 +2,56 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import type { ApiResponse } from '@/types';
 
+// Singleton Innertube client — reused across requests in the same worker process
+let _innertubeClient: unknown = null;
+
+async function getInnertube() {
+  if (!_innertubeClient) {
+    const { Innertube } = await import('youtubei.js');
+    _innertubeClient = await Innertube.create({
+      retrieve_player: false,
+    });
+  }
+  return _innertubeClient as Awaited<ReturnType<typeof import('youtubei.js').Innertube.create>>;
+}
+
+/**
+ * Fetch transcript for a video using youtubei.js (Innertube API).
+ * Tries English first, then falls back to any available language.
+ * Returns plain text string.
+ */
+async function fetchTranscriptText(videoId: string): Promise<{ text: string; language: string }> {
+  const yt = await getInnertube();
+  const info = await yt.getInfo(videoId);
+
+  const transcriptData = await info.getTranscript();
+
+  if (!transcriptData?.transcript?.content?.body?.initial_segments) {
+    throw new Error('No transcript available for this video');
+  }
+
+  const segments = transcriptData.transcript.content.body.initial_segments;
+
+  const text = segments
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    .map((seg: any) => seg?.snippet?.text ?? '')
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (text.length < 50) {
+    throw new Error('Transcript too short or empty');
+  }
+
+  // Detect language from transcript metadata if available
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const lang = (transcriptData.transcript as any)?.content?.footer?.language_menu
+    ?.sub_menu_items?.[0]?.title ?? 'en';
+
+  return { text, language: lang };
+}
+
 export async function POST(req: NextRequest) {
   const admin = createAdminClient();
 
@@ -19,28 +69,12 @@ export async function POST(req: NextRequest) {
     }
 
     let transcriptText: string;
-    const language = 'en';
+    let language = 'en';
 
     try {
-      const { YoutubeTranscript } = await import('youtube-transcript');
-      const entries = await YoutubeTranscript.fetchTranscript(video_id, { lang: 'en' })
-        .catch(() => YoutubeTranscript.fetchTranscript(video_id)); // fallback: any language
-
-      if (!entries || entries.length === 0) {
-        throw new Error('No transcript available for this video');
-      }
-
-      transcriptText = entries
-        .map((e: { text: string }) => e.text.trim())
-        .filter(Boolean)
-        .join(' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-
-      if (transcriptText.length < 50) {
-        throw new Error('Transcript too short or empty');
-      }
-
+      const result = await fetchTranscriptText(video_id);
+      transcriptText = result.text;
+      language = result.language;
     } catch (transcriptErr) {
       const errMsg = transcriptErr instanceof Error ? transcriptErr.message : 'Transcript fetch failed';
       console.error(`[extract] video ${video_id}:`, errMsg);
@@ -88,6 +122,7 @@ export async function POST(req: NextRequest) {
         video_id,
         word_count: transcriptText.split(/\s+/).length,
         char_count: transcriptText.length,
+        language,
       }
     });
 

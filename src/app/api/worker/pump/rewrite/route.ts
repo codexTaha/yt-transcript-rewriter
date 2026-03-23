@@ -1,0 +1,127 @@
+import { NextRequest, NextResponse } from 'next/server';
+import { createAdminClient } from '@/lib/supabase/admin';
+import type { ApiResponse } from '@/types';
+
+const BATCH_SIZE = 3;
+const MAX_RETRIES = 3;
+
+export async function POST(req: NextRequest) {
+  const admin = createAdminClient();
+
+  try {
+    const body = await req.json();
+    const { job_id } = body;
+
+    if (!job_id) {
+      return NextResponse.json<ApiResponse>({ success: false, error: 'job_id is required' }, { status: 400 });
+    }
+
+    const { data: job } = await admin
+      .from('jobs')
+      .select('status, master_prompt, ai_model')
+      .eq('id', job_id)
+      .single();
+
+    if (!job || !['rewriting', 'queued_for_rewrite'].includes(job.status)) {
+      return NextResponse.json<ApiResponse>({
+        success: true,
+        data: { processed: 0, remaining: 0, message: 'Job not in rewriting state' }
+      });
+    }
+
+    // Claim next batch of queued videos
+    const { data: batch } = await admin
+      .from('job_videos')
+      .select('id, video_id')
+      .eq('job_id', job_id)
+      .eq('rewrite_status', 'queued')
+      .lt('rewrite_retry_count', MAX_RETRIES)
+      .order('discovery_position', { ascending: true })
+      .limit(BATCH_SIZE);
+
+    if (!batch || batch.length === 0) {
+      const { count: queuedCount } = await admin
+        .from('job_videos')
+        .select('*', { count: 'exact', head: true })
+        .eq('job_id', job_id)
+        .eq('rewrite_status', 'queued');
+
+      const { count: processingCount } = await admin
+        .from('job_videos')
+        .select('*', { count: 'exact', head: true })
+        .eq('job_id', job_id)
+        .eq('rewrite_status', 'processing');
+
+      if ((queuedCount ?? 0) === 0 && (processingCount ?? 0) === 0) {
+        // All rewrites done — trigger export
+        const { count: successCount } = await admin
+          .from('job_videos')
+          .select('*', { count: 'exact', head: true })
+          .eq('job_id', job_id)
+          .eq('rewrite_status', 'done');
+
+        const { count: failedCount } = await admin
+          .from('job_videos')
+          .select('*', { count: 'exact', head: true })
+          .eq('job_id', job_id)
+          .eq('rewrite_status', 'failed');
+
+        await admin.from('jobs').update({
+          status: 'building_export',
+          rewrite_success_count: successCount ?? 0,
+          rewrite_failed_count: failedCount ?? 0,
+        }).eq('id', job_id);
+
+        // Trigger export generation
+        const baseUrl = process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000';
+        fetch(`${baseUrl}/api/jobs/${job_id}/export`, { method: 'POST' }).catch(() => {});
+
+        return NextResponse.json<ApiResponse>({
+          success: true,
+          data: { processed: 0, remaining: 0, advanced: true }
+        });
+      }
+
+      return NextResponse.json<ApiResponse>({
+        success: true,
+        data: { processed: 0, remaining: (queuedCount ?? 0) + (processingCount ?? 0) }
+      });
+    }
+
+    // Mark as processing
+    const batchIds = batch.map(v => v.id);
+    await admin
+      .from('job_videos')
+      .update({ rewrite_status: 'processing', rewrite_attempted_at: new Date().toISOString() })
+      .in('id', batchIds);
+
+    // Process in parallel
+    const baseUrl = process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000';
+    const results = await Promise.allSettled(
+      batch.map(video =>
+        fetch(`${baseUrl}/api/worker/rewrite`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ job_id, job_video_id: video.id, video_id: video.video_id })
+        })
+      )
+    );
+
+    const processed = results.filter(r => r.status === 'fulfilled').length;
+
+    const { count: remaining } = await admin
+      .from('job_videos')
+      .select('*', { count: 'exact', head: true })
+      .eq('job_id', job_id)
+      .eq('rewrite_status', 'queued');
+
+    return NextResponse.json<ApiResponse>({
+      success: true,
+      data: { processed, remaining: remaining ?? 0 }
+    });
+
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Rewrite pump failed';
+    return NextResponse.json<ApiResponse>({ success: false, error: message }, { status: 500 });
+  }
+}

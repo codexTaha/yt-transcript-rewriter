@@ -7,23 +7,22 @@ import type { ApiResponse } from '@/types';
 
 export async function POST(
   req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
+  const { id } = await params;
   const admin = createAdminClient();
 
   try {
-    // Auth via user client
     const userClient = await createClient();
     const { data: { user }, error: authError } = await userClient.auth.getUser();
     if (authError || !user) {
       return NextResponse.json<ApiResponse>({ success: false, error: 'Unauthorized' }, { status: 401 });
     }
 
-    // Fetch the job
     const { data: job, error: jobError } = await admin
       .from('jobs')
       .select('*')
-      .eq('id', params.id)
+      .eq('id', id)
       .eq('user_id', user.id)
       .single();
 
@@ -31,7 +30,6 @@ export async function POST(
       return NextResponse.json<ApiResponse>({ success: false, error: 'Job not found' }, { status: 404 });
     }
 
-    // Idempotency: skip if already past discovering
     if (!['created', 'discovering'].includes(job.status)) {
       return NextResponse.json<ApiResponse>({
         success: true,
@@ -39,38 +37,26 @@ export async function POST(
       });
     }
 
-    // Set status to discovering
     await admin
       .from('jobs')
       .update({ status: 'discovering', discovery_started_at: new Date().toISOString() })
-      .eq('id', params.id);
+      .eq('id', id);
 
-    // Validate and run discovery
     const validated = validateYouTubeUrl(job.source_url);
     if (!validated) {
-      await admin.from('jobs').update({
-        status: 'failed',
-        error_message: 'Invalid source URL'
-      }).eq('id', params.id);
+      await admin.from('jobs').update({ status: 'failed', error_message: 'Invalid source URL' }).eq('id', id);
       return NextResponse.json<ApiResponse>({ success: false, error: 'Invalid source URL' }, { status: 400 });
     }
 
     const result = await discoverVideos(validated.type, validated.rawId, validated.normalizedUrl);
 
     if (result.videos.length === 0) {
-      await admin.from('jobs').update({
-        status: 'failed',
-        error_message: 'No videos found for this source.'
-      }).eq('id', params.id);
-      return NextResponse.json<ApiResponse>({
-        success: false,
-        error: 'No videos found'
-      }, { status: 422 });
+      await admin.from('jobs').update({ status: 'failed', error_message: 'No videos found.' }).eq('id', id);
+      return NextResponse.json<ApiResponse>({ success: false, error: 'No videos found' }, { status: 422 });
     }
 
-    // Bulk insert job_videos rows
     const videoRows = result.videos.map((v) => ({
-      job_id: params.id,
+      job_id: id,
       video_id: v.video_id,
       video_title: v.title,
       video_url: `https://www.youtube.com/watch?v=${v.video_id}`,
@@ -83,23 +69,13 @@ export async function POST(
       rewrite_retry_count: 0,
     }));
 
-    const { error: insertError } = await admin
-      .from('job_videos')
-      .insert(videoRows);
+    const { error: insertError } = await admin.from('job_videos').insert(videoRows);
 
     if (insertError) {
-      console.error('[discover] insert job_videos error:', insertError);
-      await admin.from('jobs').update({
-        status: 'failed',
-        error_message: 'Failed to save discovered videos'
-      }).eq('id', params.id);
-      return NextResponse.json<ApiResponse>({
-        success: false,
-        error: 'Failed to save discovered videos'
-      }, { status: 500 });
+      await admin.from('jobs').update({ status: 'failed', error_message: 'Failed to save videos' }).eq('id', id);
+      return NextResponse.json<ApiResponse>({ success: false, error: 'Failed to save videos' }, { status: 500 });
     }
 
-    // Update job with discovery results
     await admin.from('jobs').update({
       status: 'extracting',
       source_name: result.source_name,
@@ -107,29 +83,16 @@ export async function POST(
       source_playlist_id: result.source_playlist_id ?? null,
       total_video_count: result.videos.length,
       extraction_started_at: new Date().toISOString(),
-    }).eq('id', params.id);
+    }).eq('id', id);
 
     return NextResponse.json<ApiResponse>({
       success: true,
-      data: {
-        video_count: result.videos.length,
-        source_name: result.source_name,
-        source_type: result.source_type,
-      }
+      data: { video_count: result.videos.length, source_name: result.source_name }
     });
 
   } catch (err) {
-    console.error('[discover] error:', err);
     const message = err instanceof Error ? err.message : 'Discovery failed';
-
-    await admin.from('jobs').update({
-      status: 'failed',
-      error_message: message
-    }).eq('id', params.id).catch(() => {});
-
-    return NextResponse.json<ApiResponse>({
-      success: false,
-      error: message
-    }, { status: 500 });
+    await admin.from('jobs').update({ status: 'failed', error_message: message }).eq('id', id).catch(() => {});
+    return NextResponse.json<ApiResponse>({ success: false, error: message }, { status: 500 });
   }
 }

@@ -10,13 +10,13 @@
     "type-check": "tsc --noEmit"
   },
   "dependencies": {
-    "next": "14.2.3",
-    "react": "^18",
-    "react-dom": "^18",
+    "next": "15.2.4",
+    "react": "^19",
+    "react-dom": "^19",
     "@supabase/supabase-js": "^2.43.4",
-    "@supabase/ssr": "^0.3.0",
+    "@supabase/ssr": "^0.6.1",
     "@anthropic-ai/sdk": "^0.24.3",
-    "youtube-transcript-api-node": "^1.0.0",
+    "yt-transcript-api": "^1.0.0",
     "clsx": "^2.1.1",
     "tailwind-merge": "^2.3.0",
     "lucide-react": "^0.379.0",
@@ -26,12 +26,12 @@
   "devDependencies": {
     "typescript": "^5",
     "@types/node": "^20",
-    "@types/react": "^18",
-    "@types/react-dom": "^18",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
     "tailwindcss": "^3.4.3",
     "postcss": "^8",
     "autoprefixer": "^10.0.1",
-    "eslint": "^8",
-    "eslint-config-next": "14.2.3"
+    "eslint": "^9",
+    "eslint-config-next": "15.2.4"
   }
 }

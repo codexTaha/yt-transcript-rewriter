@@ -1,0 +1,22 @@
+{
+  "functions": {
+    "src/app/api/worker/extract/route.ts": {
+      "maxDuration": 30
+    },
+    "src/app/api/worker/rewrite/route.ts": {
+      "maxDuration": 60
+    },
+    "src/app/api/worker/pump/extract/route.ts": {
+      "maxDuration": 60
+    },
+    "src/app/api/worker/pump/rewrite/route.ts": {
+      "maxDuration": 60
+    },
+    "src/app/api/jobs/[id]/discover/route.ts": {
+      "maxDuration": 30
+    },
+    "src/app/api/jobs/[id]/export/route.ts": {
+      "maxDuration": 60
+    }
+  }
+}

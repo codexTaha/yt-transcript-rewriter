@@ -18,21 +18,18 @@ export async function POST(req: NextRequest) {
       return NextResponse.json<ApiResponse>({ success: false, error: 'Missing required fields' }, { status: 400 });
     }
 
-    // Dynamically import to avoid SSR issues
-    const { YoutubeTranscript } = await import('yt-transcript-api');
-
     let transcriptText: string;
-    let language = 'en';
+    const language = 'en';
 
     try {
-      // Fetch transcript — tries auto-generated and manual captions
-      const entries = await YoutubeTranscript.fetchTranscript(video_id);
+      const { YoutubeTranscript } = await import('youtube-transcript');
+      const entries = await YoutubeTranscript.fetchTranscript(video_id, { lang: 'en' })
+        .catch(() => YoutubeTranscript.fetchTranscript(video_id)); // fallback: any language
 
       if (!entries || entries.length === 0) {
-        throw new Error('No transcript available');
+        throw new Error('No transcript available for this video');
       }
 
-      // Join all text entries into a clean paragraph
       transcriptText = entries
         .map((e: { text: string }) => e.text.trim())
         .filter(Boolean)
@@ -46,8 +43,8 @@ export async function POST(req: NextRequest) {
 
     } catch (transcriptErr) {
       const errMsg = transcriptErr instanceof Error ? transcriptErr.message : 'Transcript fetch failed';
+      console.error(`[extract] video ${video_id}:`, errMsg);
 
-      // Increment retry count
       const { data: current } = await admin
         .from('job_videos')
         .select('transcript_retry_count')
@@ -63,27 +60,18 @@ export async function POST(req: NextRequest) {
         transcript_retry_count: retryCount,
       }).eq('id', job_video_id);
 
-      return NextResponse.json<ApiResponse>({
-        success: false,
-        error: errMsg
-      }, { status: 422 });
+      return NextResponse.json<ApiResponse>({ success: false, error: errMsg }, { status: 422 });
     }
 
-    // Store transcript in Supabase Storage
+    // Upload to Supabase Storage
     const storagePath = `${job_id}/${video_id}/transcript.txt`;
     const { error: uploadError } = await admin
       .storage
       .from('transcripts')
-      .upload(storagePath, transcriptText, {
-        contentType: 'text/plain',
-        upsert: true,
-      });
+      .upload(storagePath, transcriptText, { contentType: 'text/plain', upsert: true });
 
-    if (uploadError) {
-      throw new Error(`Storage upload failed: ${uploadError.message}`);
-    }
+    if (uploadError) throw new Error(`Storage upload failed: ${uploadError.message}`);
 
-    // Update job_video row as done
     await admin.from('job_videos').update({
       transcript_status: 'done',
       transcript_storage_path: `transcripts/${storagePath}`,
@@ -105,15 +93,13 @@ export async function POST(req: NextRequest) {
 
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Extraction failed';
-    console.error('[extract worker] error:', message);
-
+    console.error('[extract worker] fatal:', message);
     if (job_video_id) {
       await admin.from('job_videos').update({
         transcript_status: 'failed',
         transcript_error: message,
       }).eq('id', job_video_id).catch(() => {});
     }
-
     return NextResponse.json<ApiResponse>({ success: false, error: message }, { status: 500 });
   }
 }

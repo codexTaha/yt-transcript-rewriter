@@ -2,8 +2,13 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import type { ApiResponse } from '@/types';
 
-const BATCH_SIZE = 3;
+// 1 video at a time — Gemini free tier is 5 RPM / 20 RPD.
+// The client poller calls pump every few seconds, giving natural spacing.
+const BATCH_SIZE = 1;
 const MAX_RETRIES = 3;
+
+// If a rewrite worker crashes before writing done/failed, reset after 90s
+const PROCESSING_STALE_MS = 90_000;
 
 export async function POST(req: NextRequest) {
   const admin = createAdminClient();
@@ -32,9 +37,17 @@ export async function POST(req: NextRequest) {
       });
     }
 
+    // --- Unstick stale 'processing' rows ---
+    const staleThreshold = new Date(Date.now() - PROCESSING_STALE_MS).toISOString();
+    await admin
+      .from('job_videos')
+      .update({ rewrite_status: 'queued', rewrite_not_before: null })
+      .eq('job_id', job_id)
+      .eq('rewrite_status', 'processing')
+      .lt('rewrite_attempted_at', staleThreshold);
+
     const now = new Date().toISOString();
 
-    // Count videos that are queued AND whose backoff window has passed
     const { count: currentQueued } = await admin
       .from('job_videos')
       .select('*', { count: 'exact', head: true })
@@ -49,7 +62,6 @@ export async function POST(req: NextRequest) {
       .eq('job_id', job_id)
       .eq('rewrite_status', 'processing');
 
-    // Count videos still in backoff (queued but not ready yet)
     const { count: inBackoff } = await admin
       .from('job_videos')
       .select('*', { count: 'exact', head: true })
@@ -58,9 +70,8 @@ export async function POST(req: NextRequest) {
       .not('rewrite_not_before', 'is', null)
       .gt('rewrite_not_before', now);
 
-    // Nothing ready AND nothing processing — check if truly done
+    // --- All done? Advance job ---
     if ((currentQueued ?? 0) === 0 && (currentProcessing ?? 0) === 0) {
-      // If some are still in backoff, report waiting
       if ((inBackoff ?? 0) > 0) {
         return NextResponse.json<ApiResponse>({
           success: true,
@@ -68,7 +79,6 @@ export async function POST(req: NextRequest) {
         });
       }
 
-      // All done — advance job status
       const { count: successCount } = await admin
         .from('job_videos')
         .select('*', { count: 'exact', head: true })
@@ -100,15 +110,23 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // Nothing ready but some still processing — wait
-    if ((currentQueued ?? 0) === 0 && (currentProcessing ?? 0) > 0) {
+    // --- Already processing one — wait ---
+    if ((currentProcessing ?? 0) >= BATCH_SIZE) {
       return NextResponse.json<ApiResponse>({
         success: true,
-        data: { processed: 0, remaining: currentProcessing ?? 0, waiting: true },
+        data: { processed: 0, remaining: (currentQueued ?? 0) + (currentProcessing ?? 0), waiting: true },
       });
     }
 
-    // Claim next ready batch (respects backoff: only grab ones where not_before <= now)
+    // --- Nothing ready yet (all in backoff) ---
+    if ((currentQueued ?? 0) === 0) {
+      return NextResponse.json<ApiResponse>({
+        success: true,
+        data: { processed: 0, remaining: (inBackoff ?? 0) + (currentProcessing ?? 0), waiting: true, message: 'Waiting for backoff' },
+      });
+    }
+
+    // --- Dispatch next single video ---
     const { data: batch } = await admin
       .from('job_videos')
       .select('id, video_id')
@@ -120,10 +138,9 @@ export async function POST(req: NextRequest) {
       .limit(BATCH_SIZE);
 
     if (!batch || batch.length === 0) {
-      const remaining = (currentProcessing ?? 0) + (inBackoff ?? 0);
       return NextResponse.json<ApiResponse>({
         success: true,
-        data: { processed: 0, remaining, waiting: remaining > 0 },
+        data: { processed: 0, remaining: (currentProcessing ?? 0) + (inBackoff ?? 0), waiting: true },
       });
     }
 
@@ -132,20 +149,20 @@ export async function POST(req: NextRequest) {
       .update({
         rewrite_status:       'processing',
         rewrite_attempted_at: new Date().toISOString(),
-        rewrite_not_before:   null, // clear backoff
+        rewrite_not_before:   null,
       })
       .in('id', batch.map((v: { id: string }) => v.id));
 
     const baseUrl = process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000';
-    await Promise.allSettled(
-      batch.map((video: { id: string; video_id: string }) =>
-        fetch(`${baseUrl}/api/worker/rewrite`, {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body:    JSON.stringify({ job_id, job_video_id: video.id, video_id: video.video_id }),
-        })
-      )
-    );
+
+    // Fire-and-forget — result tracked via DB
+    batch.forEach((video: { id: string; video_id: string }) => {
+      fetch(`${baseUrl}/api/worker/rewrite`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ job_id, job_video_id: video.id, video_id: video.video_id }),
+      }).catch(() => {});
+    });
 
     const { count: queuedAfter } = await admin
       .from('job_videos')
@@ -153,15 +170,9 @@ export async function POST(req: NextRequest) {
       .eq('job_id', job_id)
       .eq('rewrite_status', 'queued');
 
-    const { count: processingAfter } = await admin
-      .from('job_videos')
-      .select('*', { count: 'exact', head: true })
-      .eq('job_id', job_id)
-      .eq('rewrite_status', 'processing');
-
     return NextResponse.json<ApiResponse>({
       success: true,
-      data: { processed: batch.length, remaining: (queuedAfter ?? 0) + (processingAfter ?? 0) },
+      data: { processed: batch.length, remaining: (queuedAfter ?? 0) + batch.length },
     });
 
   } catch (err) {

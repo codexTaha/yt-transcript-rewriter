@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { Youtube, ArrowRight, AlertCircle, Clock } from 'lucide-react';
+import { Youtube, ArrowRight, AlertCircle } from 'lucide-react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -10,13 +10,10 @@ import { Input } from '@/components/ui/input';
 const YOUTUBE_URL_PATTERN = /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\/.+/;
 
 export default function NewJobPage() {
-  const router  = useRouter();
-  const [url, setUrl]       = useState('');
+  const router = useRouter();
+  const [url, setUrl]         = useState('');
   const [loading, setLoading] = useState(false);
   const [urlError, setUrlError] = useState('');
-
-  // Filters
-  const [minDurationHours, setMinDurationHours] = useState('');
 
   function validateUrl(value: string): boolean {
     if (!value.trim()) { setUrlError('Please enter a YouTube URL.'); return false; }
@@ -28,26 +25,20 @@ export default function NewJobPage() {
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!validateUrl(url)) return;
-
     setLoading(true);
     try {
       const createRes = await fetch('/api/jobs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          source_url: url.trim(),
-          ...(minDurationHours ? { filter_min_duration_hours: minDurationHours } : {}),
-        }),
+        body: JSON.stringify({ source_url: url.trim() }),
       });
       const createData = await createRes.json();
       if (!createData.success) throw new Error(createData.error);
-
       const jobId = createData.data.job_id;
       fetch(`/api/jobs/${jobId}/discover`, { method: 'POST' }).catch(() => {});
       router.push(`/jobs/${jobId}`);
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Failed to create job';
-      toast.error(message);
+      toast.error(err instanceof Error ? err.message : 'Failed to create job');
       setLoading(false);
     }
   }
@@ -85,35 +76,17 @@ export default function NewJobPage() {
             )}
           </div>
 
-          {/* ── Filters ── */}
-          <div className="rounded-md border border-border bg-secondary/30 p-4 space-y-4">
-            <p className="text-sm font-semibold">Filters <span className="text-muted-foreground font-normal">(optional — leave blank to include all videos)</span></p>
-
-            {/* Min watch-time */}
-            <div>
-              <label className="text-xs font-medium text-muted-foreground mb-1.5 flex items-center gap-1.5">
-                <Clock className="h-3.5 w-3.5" />
-                Minimum video duration (hours)
-              </label>
-              <Input
-                type="number"
-                min="0"
-                step="0.1"
-                placeholder="e.g. 0.5 = 30 min,  1 = 1 hour"
-                value={minDurationHours}
-                onChange={(e) => setMinDurationHours(e.target.value)}
-                className="max-w-xs"
-              />
-              <p className="text-xs text-muted-foreground mt-1">
-                Videos shorter than this will be skipped during discovery.
-              </p>
-            </div>
-
-            {/* Likes note */}
-            <div className="rounded bg-yellow-500/10 border border-yellow-500/20 px-3 py-2 text-xs text-yellow-400">
-              <strong>Note:</strong> YouTube's public API no longer exposes like counts.
-              Filtering by likes is not possible without a third-party service.
-            </div>
+          {/* Filters info */}
+          <div className="rounded-md border border-yellow-500/20 bg-yellow-500/5 px-4 py-3 text-xs text-yellow-400 space-y-1">
+            <p className="font-semibold text-yellow-300">About filters (likes & watch-time)</p>
+            <p>
+              YouTube’s public API v3 has not returned <strong>like counts</strong> since December 2021.
+              <strong> Watch-time</strong> (total hours viewed) is only available in YouTube Studio to channel owners, not via any public API.
+            </p>
+            <p>
+              Both filters are technically impossible without authenticated channel-owner access or a paid third-party scraper.
+              Per-video <strong>duration</strong> is available — if you need a minimum-length filter, ask and it can be added back.
+            </p>
           </div>
 
           {/* Supported formats */}

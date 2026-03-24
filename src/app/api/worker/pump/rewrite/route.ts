@@ -2,12 +2,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import type { ApiResponse } from '@/types';
 
-// 1 video at a time — Gemini free tier is 5 RPM / 20 RPD.
-// The client poller calls pump every few seconds, giving natural spacing.
-const BATCH_SIZE = 1;
+// OpenRouter free tier supports concurrent requests — 5 parallel is safe.
+// Each request is fire-and-forget; the pump returns immediately and the
+// client poller re-triggers it every few seconds to pick up the next batch.
+const BATCH_SIZE = 5;
 const MAX_RETRIES = 3;
-
-// If a rewrite worker crashes before writing done/failed, reset after 90s
 const PROCESSING_STALE_MS = 90_000;
 
 export async function POST(req: NextRequest) {
@@ -18,17 +17,11 @@ export async function POST(req: NextRequest) {
     const { job_id } = body;
 
     if (!job_id) {
-      return NextResponse.json<ApiResponse>(
-        { success: false, error: 'job_id is required' },
-        { status: 400 }
-      );
+      return NextResponse.json<ApiResponse>({ success: false, error: 'job_id is required' }, { status: 400 });
     }
 
     const { data: job } = await admin
-      .from('jobs')
-      .select('status, master_prompt, ai_model')
-      .eq('id', job_id)
-      .single();
+      .from('jobs').select('status, master_prompt, ai_model').eq('id', job_id).single();
 
     if (!job || !['rewriting', 'queued_for_rewrite'].includes(job.status)) {
       return NextResponse.json<ApiResponse>({
@@ -37,7 +30,7 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // --- Unstick stale 'processing' rows ---
+    // --- Unstick stale processing rows ---
     const staleThreshold = new Date(Date.now() - PROCESSING_STALE_MS).toISOString();
     await admin
       .from('job_videos')
@@ -49,57 +42,42 @@ export async function POST(req: NextRequest) {
     const now = new Date().toISOString();
 
     const { count: currentQueued } = await admin
-      .from('job_videos')
-      .select('*', { count: 'exact', head: true })
-      .eq('job_id', job_id)
-      .eq('rewrite_status', 'queued')
+      .from('job_videos').select('*', { count: 'exact', head: true })
+      .eq('job_id', job_id).eq('rewrite_status', 'queued')
       .lt('rewrite_retry_count', MAX_RETRIES)
       .or(`rewrite_not_before.is.null,rewrite_not_before.lte.${now}`);
 
     const { count: currentProcessing } = await admin
-      .from('job_videos')
-      .select('*', { count: 'exact', head: true })
-      .eq('job_id', job_id)
-      .eq('rewrite_status', 'processing');
+      .from('job_videos').select('*', { count: 'exact', head: true })
+      .eq('job_id', job_id).eq('rewrite_status', 'processing');
 
     const { count: inBackoff } = await admin
-      .from('job_videos')
-      .select('*', { count: 'exact', head: true })
-      .eq('job_id', job_id)
-      .eq('rewrite_status', 'queued')
-      .not('rewrite_not_before', 'is', null)
-      .gt('rewrite_not_before', now);
+      .from('job_videos').select('*', { count: 'exact', head: true })
+      .eq('job_id', job_id).eq('rewrite_status', 'queued')
+      .not('rewrite_not_before', 'is', null).gt('rewrite_not_before', now);
 
     // --- All done? Advance job ---
     if ((currentQueued ?? 0) === 0 && (currentProcessing ?? 0) === 0) {
       if ((inBackoff ?? 0) > 0) {
         return NextResponse.json<ApiResponse>({
           success: true,
-          data: { processed: 0, remaining: inBackoff ?? 0, waiting: true, message: 'Rate-limit backoff in progress' },
+          data: { processed: 0, remaining: inBackoff ?? 0, waiting: true, message: 'Rate-limit backoff' },
         });
       }
 
       const { count: successCount } = await admin
-        .from('job_videos')
-        .select('*', { count: 'exact', head: true })
-        .eq('job_id', job_id)
-        .eq('rewrite_status', 'done');
+        .from('job_videos').select('*', { count: 'exact', head: true })
+        .eq('job_id', job_id).eq('rewrite_status', 'done');
 
       const { count: failedCount } = await admin
-        .from('job_videos')
-        .select('*', { count: 'exact', head: true })
-        .eq('job_id', job_id)
-        .eq('rewrite_status', 'failed');
+        .from('job_videos').select('*', { count: 'exact', head: true })
+        .eq('job_id', job_id).eq('rewrite_status', 'failed');
 
-      await admin
-        .from('jobs')
-        .update({
-          status: 'building_export',
-          rewrite_success_count: successCount ?? 0,
-          rewrite_failed_count:  failedCount  ?? 0,
-        })
-        .eq('id', job_id)
-        .in('status', ['rewriting', 'queued_for_rewrite']);
+      await admin.from('jobs').update({
+        status: 'building_export',
+        rewrite_success_count: successCount ?? 0,
+        rewrite_failed_count:  failedCount  ?? 0,
+      }).eq('id', job_id).in('status', ['rewriting', 'queued_for_rewrite']);
 
       const baseUrl = process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000';
       fetch(`${baseUrl}/api/jobs/${job_id}/export`, { method: 'POST' }).catch(() => {});
@@ -110,7 +88,7 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // --- Already processing one — wait ---
+    // --- Throttle: already at batch capacity ---
     if ((currentProcessing ?? 0) >= BATCH_SIZE) {
       return NextResponse.json<ApiResponse>({
         success: true,
@@ -118,24 +96,23 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // --- Nothing ready yet (all in backoff) ---
+    // --- Nothing ready (all in backoff) ---
     if ((currentQueued ?? 0) === 0) {
       return NextResponse.json<ApiResponse>({
         success: true,
-        data: { processed: 0, remaining: (inBackoff ?? 0) + (currentProcessing ?? 0), waiting: true, message: 'Waiting for backoff' },
+        data: { processed: 0, remaining: (inBackoff ?? 0) + (currentProcessing ?? 0), waiting: true },
       });
     }
 
-    // --- Dispatch next single video ---
+    // --- Dispatch next batch (fill up to BATCH_SIZE slots) ---
+    const slots = BATCH_SIZE - (currentProcessing ?? 0);
     const { data: batch } = await admin
-      .from('job_videos')
-      .select('id, video_id')
-      .eq('job_id', job_id)
-      .eq('rewrite_status', 'queued')
+      .from('job_videos').select('id, video_id')
+      .eq('job_id', job_id).eq('rewrite_status', 'queued')
       .lt('rewrite_retry_count', MAX_RETRIES)
       .or(`rewrite_not_before.is.null,rewrite_not_before.lte.${now}`)
       .order('discovery_position', { ascending: true })
-      .limit(BATCH_SIZE);
+      .limit(slots);
 
     if (!batch || batch.length === 0) {
       return NextResponse.json<ApiResponse>({
@@ -144,18 +121,16 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    await admin
-      .from('job_videos')
-      .update({
-        rewrite_status:       'processing',
-        rewrite_attempted_at: new Date().toISOString(),
-        rewrite_not_before:   null,
-      })
-      .in('id', batch.map((v: { id: string }) => v.id));
+    // Mark as processing BEFORE firing requests
+    await admin.from('job_videos').update({
+      rewrite_status:       'processing',
+      rewrite_attempted_at: new Date().toISOString(),
+      rewrite_not_before:   null,
+    }).in('id', batch.map((v: { id: string }) => v.id));
 
     const baseUrl = process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000';
 
-    // Fire-and-forget — result tracked via DB
+    // Fire-and-forget — all BATCH_SIZE run in parallel
     batch.forEach((video: { id: string; video_id: string }) => {
       fetch(`${baseUrl}/api/worker/rewrite`, {
         method:  'POST',
@@ -165,10 +140,8 @@ export async function POST(req: NextRequest) {
     });
 
     const { count: queuedAfter } = await admin
-      .from('job_videos')
-      .select('*', { count: 'exact', head: true })
-      .eq('job_id', job_id)
-      .eq('rewrite_status', 'queued');
+      .from('job_videos').select('*', { count: 'exact', head: true })
+      .eq('job_id', job_id).eq('rewrite_status', 'queued');
 
     return NextResponse.json<ApiResponse>({
       success: true,

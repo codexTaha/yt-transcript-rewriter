@@ -1,10 +1,12 @@
 /**
  * Fetches a YouTube transcript by spawning fetch_transcript.py.
- * Uses the same proxy pattern as roundyyy/yt-bulk-subtitles-downloader:
- *   GenericProxyConfig(http_url, https_url) from youtube_transcript_api.proxies
  *
- * Proxy is auto-read from PROXY_URL env var (format: host:port or user:pass@host:port).
- * You can also pass a proxy explicitly as the second argument.
+ * Proxy priority (handled entirely in the Python script via env vars):
+ *   1. WEBSHARE_PROXY_USERNAME + WEBSHARE_PROXY_PASSWORD -> WebshareProxyConfig (rotating residential)
+ *   2. PROXY_URL                                         -> GenericProxyConfig
+ *   3. No proxy (direct)
+ *
+ * No proxy configuration needed here — just set the right env vars in .env.local.
  */
 import { execFile } from 'child_process';
 import { promisify } from 'util';
@@ -22,39 +24,47 @@ export interface TranscriptResult {
 
 /**
  * Fetch transcript for a YouTube video ID.
+ * Proxy config is resolved automatically from environment variables by the Python script.
  * @param videoId   - YouTube video ID (e.g. "dQw4w9WgXcQ")
- * @param proxy     - Optional proxy string "host:port" or "user:pass@host:port".
- *                    Falls back to PROXY_URL env var if not supplied.
  * @param timeoutMs - Timeout in milliseconds (default 30s)
  */
 export async function fetchTranscript(
   videoId: string,
-  proxy?: string,
   timeoutMs = 30_000
 ): Promise<TranscriptResult> {
-  const resolvedProxy = proxy ?? resolveProxyFromEnv();
-
   const args: string[] = [SCRIPT_PATH, videoId];
-  if (resolvedProxy) args.push(resolvedProxy);
 
-  // Log what proxy is being used (helpful for debugging)
-  console.log(`[fetchTranscript] video=${videoId} proxy=${resolvedProxy ?? '(none)'}`);
+  // Pass relevant env vars through to the Python subprocess
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    // Explicitly forward proxy env vars in case they aren't inherited
+    WEBSHARE_PROXY_USERNAME: process.env.WEBSHARE_PROXY_USERNAME ?? '',
+    WEBSHARE_PROXY_PASSWORD: process.env.WEBSHARE_PROXY_PASSWORD ?? '',
+    PROXY_URL: process.env.PROXY_URL ?? '',
+  };
+
+  const proxyMode =
+    env.WEBSHARE_PROXY_USERNAME ? 'webshare' :
+    env.PROXY_URL               ? `generic:${env.PROXY_URL}` :
+                                   'direct';
+  console.log(`[fetchTranscript] video=${videoId} proxy_mode=${proxyMode}`);
 
   let stdout: string;
-  let stderr: string = '';
+  let stderr = '';
   try {
     const result = await execFileAsync(PYTHON, args, {
       timeout: timeoutMs,
       maxBuffer: 10 * 1024 * 1024,
+      env,
     });
     stdout = result.stdout;
     stderr = result.stderr ?? '';
   } catch (err: unknown) {
-    const e = err as { stdout?: string; stderr?: string; message?: string; killed?: boolean; code?: string };
+    const e = err as { stdout?: string; stderr?: string; message?: string; killed?: boolean };
     stdout = e.stdout ?? '';
     stderr = e.stderr ?? '';
     if (!stdout.trim()) {
-      const killed = e.killed ? ' (process killed — timeout?)' : '';
+      const killed = e.killed ? ' (process killed — timeout)' : '';
       const stderrDetail = stderr.trim() ? `\nstderr: ${stderr.slice(0, 500)}` : '';
       throw new Error(
         `Python script failed${killed}: ${e.message ?? 'unknown error'}${stderrDetail}`
@@ -63,10 +73,10 @@ export async function fetchTranscript(
   }
 
   if (stderr.trim()) {
-    console.warn(`[fetchTranscript] stderr for ${videoId}: ${stderr.slice(0, 300)}`);
+    console.log(`[fetchTranscript] py stderr [${videoId}]: ${stderr.trim().slice(0, 300)}`);
   }
 
-  let parsed: { success: boolean; text?: string; language?: string; error?: string };
+  let parsed: { success: boolean; text?: string; language?: string; error?: string; proxy?: string };
   try {
     parsed = JSON.parse(stdout.trim());
   } catch {
@@ -78,21 +88,4 @@ export async function fetchTranscript(
   }
 
   return { text: parsed.text, language: parsed.language ?? 'en' };
-}
-
-/**
- * Parse PROXY_URL env var into a "host:port" or "user:pass@host:port" string
- * that the Python script expects.
- *
- * Accepts any of:
- *   http://host:port
- *   http://user:pass@host:port
- *   host:port              (bare, no scheme)
- */
-function resolveProxyFromEnv(): string | undefined {
-  const raw = process.env.PROXY_URL?.trim();
-  if (!raw) return undefined;
-  // Strip scheme (http:// or https://) — Python script prepends its own
-  const stripped = raw.replace(/^https?:\/\//i, '');
-  return stripped || undefined;
 }

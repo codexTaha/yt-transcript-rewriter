@@ -1,12 +1,15 @@
 /**
- * Fetches a YouTube transcript by spawning fetch_transcript.py.
+ * Fetches a YouTube transcript by spawning scripts/fetch_transcript.py.
  *
- * Proxy priority (handled entirely in the Python script via env vars):
- *   1. WEBSHARE_PROXY_USERNAME + WEBSHARE_PROXY_PASSWORD -> WebshareProxyConfig (rotating residential)
- *   2. PROXY_URL                                         -> GenericProxyConfig
- *   3. No proxy (direct)
+ * Auth priority (all handled in Python, just set env vars):
+ *   1. YOUTUBE_COOKIES_FILE  -> path to Netscape cookies.txt exported from your browser
+ *   2. WEBSHARE_PROXY_USERNAME + WEBSHARE_PROXY_PASSWORD -> paid rotating residential
+ *   3. PROXY_URL             -> generic proxy host:port
+ *   4. Direct connection     -> works locally, gets blocked on cloud VPS
  *
- * No proxy configuration needed here — just set the right env vars in .env.local.
+ * For local dev without a proxy, export cookies.txt from your browser:
+ *   Chrome/Firefox extension: "Get cookies.txt LOCALLY" or "Cookie-Editor"
+ *   Then set: YOUTUBE_COOKIES_FILE=/absolute/path/to/cookies.txt
  */
 import { execFile } from 'child_process';
 import { promisify } from 'util';
@@ -24,35 +27,34 @@ export interface TranscriptResult {
 
 /**
  * Fetch transcript for a YouTube video ID.
- * Proxy config is resolved automatically from environment variables by the Python script.
- * @param videoId   - YouTube video ID (e.g. "dQw4w9WgXcQ")
- * @param timeoutMs - Timeout in milliseconds (default 30s)
+ * All auth/proxy config is read from environment variables by the Python script.
  */
 export async function fetchTranscript(
   videoId: string,
-  timeoutMs = 30_000
+  timeoutMs = 60_000   // raised to 60s to handle slow proxy retries
 ): Promise<TranscriptResult> {
-  const args: string[] = [SCRIPT_PATH, videoId];
+  const authMode =
+    process.env.YOUTUBE_COOKIES_FILE                ? `cookies:${process.env.YOUTUBE_COOKIES_FILE}` :
+    process.env.WEBSHARE_PROXY_USERNAME             ? 'webshare' :
+    process.env.PROXY_URL                           ? `proxy:${process.env.PROXY_URL}` :
+                                                      'direct';
 
-  // Pass relevant env vars through to the Python subprocess
+  console.log(`[fetchTranscript] video=${videoId} auth=${authMode}`);
+
+  // Forward all relevant env vars explicitly to the subprocess
   const env: NodeJS.ProcessEnv = {
     ...process.env,
-    // Explicitly forward proxy env vars in case they aren't inherited
-    WEBSHARE_PROXY_USERNAME: process.env.WEBSHARE_PROXY_USERNAME ?? '',
-    WEBSHARE_PROXY_PASSWORD: process.env.WEBSHARE_PROXY_PASSWORD ?? '',
-    PROXY_URL: process.env.PROXY_URL ?? '',
+    YOUTUBE_COOKIES_FILE:       process.env.YOUTUBE_COOKIES_FILE       ?? '',
+    WEBSHARE_PROXY_USERNAME:    process.env.WEBSHARE_PROXY_USERNAME    ?? '',
+    WEBSHARE_PROXY_PASSWORD:    process.env.WEBSHARE_PROXY_PASSWORD    ?? '',
+    PROXY_URL:                  process.env.PROXY_URL                  ?? '',
   };
 
-  const proxyMode =
-    env.WEBSHARE_PROXY_USERNAME ? 'webshare' :
-    env.PROXY_URL               ? `generic:${env.PROXY_URL}` :
-                                   'direct';
-  console.log(`[fetchTranscript] video=${videoId} proxy_mode=${proxyMode}`);
-
-  let stdout: string;
+  let stdout = '';
   let stderr = '';
+
   try {
-    const result = await execFileAsync(PYTHON, args, {
+    const result = await execFileAsync(PYTHON, [SCRIPT_PATH, videoId], {
       timeout: timeoutMs,
       maxBuffer: 10 * 1024 * 1024,
       env,
@@ -64,23 +66,21 @@ export async function fetchTranscript(
     stdout = e.stdout ?? '';
     stderr = e.stderr ?? '';
     if (!stdout.trim()) {
-      const killed = e.killed ? ' (process killed — timeout)' : '';
-      const stderrDetail = stderr.trim() ? `\nstderr: ${stderr.slice(0, 500)}` : '';
-      throw new Error(
-        `Python script failed${killed}: ${e.message ?? 'unknown error'}${stderrDetail}`
-      );
+      const killed = e.killed ? ' (process timed out)' : '';
+      const detail = stderr.trim() ? `\nstderr: ${stderr.slice(0, 500)}` : '';
+      throw new Error(`Python script failed${killed}: ${e.message ?? 'unknown'}${detail}`);
     }
   }
 
   if (stderr.trim()) {
-    console.log(`[fetchTranscript] py stderr [${videoId}]: ${stderr.trim().slice(0, 300)}`);
+    console.log(`[fetchTranscript] py[${videoId}]: ${stderr.trim().slice(0, 300)}`);
   }
 
-  let parsed: { success: boolean; text?: string; language?: string; error?: string; proxy?: string };
+  let parsed: { success: boolean; text?: string; language?: string; error?: string };
   try {
     parsed = JSON.parse(stdout.trim());
   } catch {
-    throw new Error(`Invalid JSON from transcript script: ${stdout.slice(0, 200)}`);
+    throw new Error(`Invalid JSON from script: ${stdout.slice(0, 200)}`);
   }
 
   if (!parsed.success || !parsed.text) {

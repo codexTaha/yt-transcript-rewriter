@@ -2,14 +2,14 @@
 """
 Transcript fetcher using youtube-transcript-api.
 
-Proxy priority (env vars read directly here):
-  1. WEBSHARE_PROXY_USERNAME + WEBSHARE_PROXY_PASSWORD  -> WebshareProxyConfig (rotating residential)
-  2. PROXY_URL (host:port or user:pass@host:port)        -> GenericProxyConfig
-  3. CLI arg [proxy_host:port]                           -> GenericProxyConfig
-  4. No proxy
+Auth priority:
+  1. YOUTUBE_COOKIES_FILE env var  -> path to a Netscape cookies.txt from your browser
+  2. WEBSHARE_PROXY_USERNAME/PASSWORD -> WebshareProxyConfig (paid rotating residential only)
+  3. PROXY_URL (host:port)           -> GenericProxyConfig
+  4. Direct (no auth)
 
 Usage:
-  python fetch_transcript.py <video_id> [proxy_host:port]
+  python fetch_transcript.py <video_id>
 
 Outputs JSON to stdout:
   {"success": true, "text": "...", "language": "..."}
@@ -20,14 +20,27 @@ import sys
 import json
 import os
 
+
 def build_api():
     """
-    Build a YouTubeTranscriptApi instance with the best available proxy config.
-    Returns (ytt_api, proxy_description).
+    Build a YouTubeTranscriptApi instance with best available auth.
+    Returns (ytt_api, description_string).
     """
     from youtube_transcript_api import YouTubeTranscriptApi
 
-    # --- Priority 1: Webshare rotating residential proxies ---
+    # --- Priority 1: cookies.txt (most reliable, no proxy needed) ---
+    cookies_file = os.environ.get("YOUTUBE_COOKIES_FILE", "").strip()
+    if cookies_file and os.path.isfile(cookies_file):
+        try:
+            from youtube_transcript_api.cookies import CookieConfig
+            cookie_config = CookieConfig(cookie_file=cookies_file)
+            ytt_api = YouTubeTranscriptApi(cookie_config=cookie_config)
+            print(f"[fetch_transcript] using CookieConfig from {cookies_file}", file=sys.stderr)
+            return ytt_api, f"cookies:{cookies_file}"
+        except (ImportError, Exception) as e:
+            print(f"[fetch_transcript] CookieConfig failed ({e}), trying next option", file=sys.stderr)
+
+    # --- Priority 2: Webshare rotating residential (paid tier required) ---
     ws_user = os.environ.get("WEBSHARE_PROXY_USERNAME", "").strip()
     ws_pass = os.environ.get("WEBSHARE_PROXY_PASSWORD", "").strip()
     if ws_user and ws_pass:
@@ -37,44 +50,34 @@ def build_api():
                 proxy_username=ws_user,
                 proxy_password=ws_pass,
             )
-            print("[fetch_transcript] using WebshareProxyConfig (rotating residential)", file=sys.stderr)
-            return YouTubeTranscriptApi(proxy_config=proxy_config), "webshare"
-        except ImportError:
-            print("[fetch_transcript] WARNING: WebshareProxyConfig not available, upgrade youtube-transcript-api", file=sys.stderr)
-        except Exception as e:
-            print(f"[fetch_transcript] WARNING: WebshareProxyConfig failed: {e}", file=sys.stderr)
+            ytt_api = YouTubeTranscriptApi(proxy_config=proxy_config)
+            print("[fetch_transcript] using WebshareProxyConfig", file=sys.stderr)
+            return ytt_api, "webshare"
+        except (ImportError, Exception) as e:
+            print(f"[fetch_transcript] WebshareProxyConfig failed ({e}), trying next option", file=sys.stderr)
 
-    # --- Priority 2: Generic proxy from PROXY_URL env var ---
-    proxy_url_env = os.environ.get("PROXY_URL", "").strip()
-    # Strip scheme if present — we add http:// ourselves
-    proxy_raw = proxy_url_env.replace("https://", "").replace("http://", "") if proxy_url_env else ""
-
-    # --- Priority 3: CLI arg ---
-    cli_proxy = sys.argv[2] if len(sys.argv) > 2 else ""
-
-    proxy = proxy_raw or cli_proxy
-
-    if proxy:
+    # --- Priority 3: Generic proxy from PROXY_URL env var ---
+    proxy_raw = os.environ.get("PROXY_URL", "").strip()
+    proxy_raw = proxy_raw.replace("https://", "").replace("http://", "")
+    if proxy_raw:
         try:
             from youtube_transcript_api.proxies import GenericProxyConfig
-            proxy_url = f"http://{proxy}"
+            proxy_url = f"http://{proxy_raw}"
             proxy_config = GenericProxyConfig(http_url=proxy_url, https_url=proxy_url)
+            ytt_api = YouTubeTranscriptApi(proxy_config=proxy_config)
             print(f"[fetch_transcript] using GenericProxyConfig proxy={proxy_url}", file=sys.stderr)
-            return YouTubeTranscriptApi(proxy_config=proxy_config), f"generic:{proxy}"
-        except ImportError:
-            print("[fetch_transcript] WARNING: GenericProxyConfig not available", file=sys.stderr)
-        except Exception as e:
-            print(f"[fetch_transcript] WARNING: GenericProxyConfig failed: {e}", file=sys.stderr)
+            return ytt_api, f"proxy:{proxy_raw}"
+        except (ImportError, Exception) as e:
+            print(f"[fetch_transcript] GenericProxyConfig failed ({e}), falling back to direct", file=sys.stderr)
 
-    # --- Priority 4: No proxy ---
-    print("[fetch_transcript] no proxy configured, using direct connection", file=sys.stderr)
+    # --- Priority 4: Direct (works fine locally, gets blocked on cloud servers) ---
+    print("[fetch_transcript] using direct connection (no auth/proxy)", file=sys.stderr)
     return YouTubeTranscriptApi(), "direct"
 
 
 def fetch(video_id: str) -> dict:
     try:
         from youtube_transcript_api import (
-            YouTubeTranscriptApi,
             NoTranscriptFound,
             TranscriptsDisabled,
             CouldNotRetrieveTranscript,
@@ -83,8 +86,7 @@ def fetch(video_id: str) -> dict:
         return {"success": False, "error": "youtube-transcript-api not installed. Run: pip install youtube-transcript-api"}
 
     try:
-        ytt_api, proxy_desc = build_api()
-
+        ytt_api, auth_desc = build_api()
         transcript_list = ytt_api.list(video_id)
 
         transcript = None
@@ -98,7 +100,7 @@ def fetch(video_id: str) -> dict:
         except NoTranscriptFound:
             pass
 
-        # 2. Try translatable transcript -> translate to English
+        # 2. Try translatable -> translate to English
         if transcript is None:
             for available in transcript_list:
                 if available.is_translatable:
@@ -129,7 +131,7 @@ def fetch(video_id: str) -> dict:
         if len(text) < 50:
             return {"success": False, "error": "Transcript too short or empty"}
 
-        return {"success": True, "text": text, "language": lang_info, "proxy": proxy_desc}
+        return {"success": True, "text": text, "language": lang_info, "auth": auth_desc}
 
     except TranscriptsDisabled:
         return {"success": False, "error": "Transcripts are disabled for this video"}
@@ -146,7 +148,6 @@ if __name__ == "__main__":
         print(json.dumps({"success": False, "error": "Usage: fetch_transcript.py <video_id>"}))
         sys.exit(1)
 
-    video_id = sys.argv[1]
-    result = fetch(video_id)
+    result = fetch(sys.argv[1])
     print(json.dumps(result, ensure_ascii=False))
     sys.exit(0 if result["success"] else 1)

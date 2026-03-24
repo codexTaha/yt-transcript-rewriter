@@ -2,17 +2,14 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import type { ApiResponse } from '@/types';
 
-// Process one video per pump cycle to avoid burst 429s.
-// The client-side poller calls the pump every few seconds,
-// so throughput is: 1 video / pump interval (e.g. 1 video every 5s).
-const BATCH_SIZE = 1;
+// How many videos to dispatch concurrently per pump tick.
+// Keep at 3 — enough parallelism without burst-triggering 429s.
+const BATCH_SIZE = 3;
 const MAX_RETRIES = 3;
 
-// Delay between dispatching each extract request (ms).
-// Only relevant if BATCH_SIZE > 1 in the future.
-const DISPATCH_DELAY_MS = 2_000;
-
-const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
+// Max time (ms) a video is allowed to sit in 'processing' before
+// we assume the worker crashed and reset it back to 'pending'.
+const PROCESSING_STALE_MS = 90_000; // 90 seconds
 
 export async function POST(req: NextRequest) {
   const admin = createAdminClient();
@@ -41,6 +38,19 @@ export async function POST(req: NextRequest) {
       });
     }
 
+    // --- Unstick stale 'processing' rows ---
+    // If a worker crashed after marking status='processing' but before
+    // writing 'done'/'failed', the pump would be blocked forever.
+    // Reset any row that has been 'processing' for over PROCESSING_STALE_MS.
+    const staleThreshold = new Date(Date.now() - PROCESSING_STALE_MS).toISOString();
+    await admin
+      .from('job_videos')
+      .update({ transcript_status: 'pending' })
+      .eq('job_id', job_id)
+      .eq('transcript_status', 'processing')
+      .lt('transcript_attempted_at', staleThreshold);
+
+    // --- Count pending / processing ---
     const { count: currentPending } = await admin
       .from('job_videos')
       .select('*', { count: 'exact', head: true })
@@ -54,6 +64,7 @@ export async function POST(req: NextRequest) {
       .eq('job_id', job_id)
       .eq('transcript_status', 'processing');
 
+    // --- All done? Advance job status ---
     if ((currentPending ?? 0) === 0 && (currentProcessing ?? 0) === 0) {
       const { count: successCount } = await admin
         .from('job_videos')
@@ -72,7 +83,7 @@ export async function POST(req: NextRequest) {
 
       const nextStatus = success === 0 ? 'failed' : 'awaiting_prompt';
       const errorMsg   = success === 0
-        ? `All ${failed} transcript extractions failed. YouTube may be rate-limiting — try again in a few minutes.`
+        ? `All ${failed} transcript extractions failed. Try setting YOUTUBE_COOKIES_FILE in .env.local.`
         : undefined;
 
       await admin
@@ -92,15 +103,16 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // While any video is still processing, wait for it to finish
-    // before dispatching another — prevents concurrent requests.
-    if ((currentProcessing ?? 0) > 0) {
+    // --- Throttle: don't dispatch more if already processing ---
+    if ((currentProcessing ?? 0) >= BATCH_SIZE) {
       return NextResponse.json<ApiResponse>({
         success: true,
         data: { processed: 0, remaining: (currentPending ?? 0) + (currentProcessing ?? 0), waiting: true },
       });
     }
 
+    // --- Dispatch next batch ---
+    const slots = BATCH_SIZE - (currentProcessing ?? 0);
     const { data: batch } = await admin
       .from('job_videos')
       .select('id, video_id')
@@ -108,16 +120,16 @@ export async function POST(req: NextRequest) {
       .eq('transcript_status', 'pending')
       .lt('transcript_retry_count', MAX_RETRIES)
       .order('discovery_position', { ascending: true })
-      .limit(BATCH_SIZE);
+      .limit(slots);
 
     if (!batch || batch.length === 0) {
       return NextResponse.json<ApiResponse>({
         success: true,
-        data: { processed: 0, remaining: 0 },
+        data: { processed: 0, remaining: currentProcessing ?? 0 },
       });
     }
 
-    // Mark as processing BEFORE dispatching
+    // Mark as processing BEFORE firing requests
     await admin
       .from('job_videos')
       .update({
@@ -128,16 +140,14 @@ export async function POST(req: NextRequest) {
 
     const baseUrl = process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000';
 
-    // Sequential dispatch with delay — avoids burst 429s on YouTube
-    for (let i = 0; i < batch.length; i++) {
-      const video = batch[i];
-      if (i > 0) await sleep(DISPATCH_DELAY_MS);
+    // Fire-and-forget — results are written to DB by the extract worker
+    batch.forEach(video => {
       fetch(`${baseUrl}/api/worker/extract`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ job_id, job_video_id: video.id, video_id: video.video_id }),
-      }).catch(() => {}); // fire-and-forget; result tracked via DB
-    }
+      }).catch(() => {});
+    });
 
     const { count: pendingAfter } = await admin
       .from('job_videos')
@@ -147,7 +157,10 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json<ApiResponse>({
       success: true,
-      data: { processed: batch.length, remaining: (pendingAfter ?? 0) + batch.length },
+      data: {
+        processed: batch.length,
+        remaining: (pendingAfter ?? 0) + batch.length,
+      },
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Pump failed';

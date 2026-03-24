@@ -1,39 +1,41 @@
 /**
  * src/lib/ai/models.ts
- * Canonical list of OpenRouter free models.
- * Primary model is tried first; on 429 the client automatically falls
- * back to fallback1, then fallback2, before giving up.
- *
- * Real model IDs verified at https://openrouter.ai/models?max_price=0
+ * Verified free model IDs on OpenRouter as of March 2026.
+ * Full list: https://openrouter.ai/models?max_price=0
  */
 
 export interface ModelOption {
-  id:          string;  // exact OpenRouter model ID
-  label:       string;  // display name shown in UI
-  description: string;  // short note
+  id:          string;
+  label:       string;
+  description: string;
   default?:    boolean;
 }
 
 export const FREE_MODELS: ModelOption[] = [
   {
-    id:          'deepseek/deepseek-r1-0528:free',
-    label:       'DeepSeek R1 (May 2528)',
-    description: 'Strong reasoning model — excellent for long-form rewriting',
+    id:          'meta-llama/llama-3.3-70b-instruct:free',
+    label:       'Llama 3.3 70B',
+    description: 'GPT-4 level quality — best overall free model',
     default:     true,
   },
   {
-    id:          'meta-llama/llama-3.3-70b-instruct:free',
-    label:       'Llama 3.3 70B',
-    description: 'Fast & capable — good balance of speed and quality',
+    id:          'google/gemma-3-27b-it:free',
+    label:       'Gemma 3 27B',
+    description: 'Google open model — 131K context, reliable availability',
   },
   {
-    id:          'mistralai/mistral-7b-instruct:free',
-    label:       'Mistral 7B',
-    description: 'Lightweight fallback — lowest rate-limit pressure',
+    id:          'mistralai/mistral-small-3.1-24b-instruct:free',
+    label:       'Mistral Small 3.1 24B',
+    description: 'Mistral free tier — 128K context, good instruction following',
+  },
+  {
+    id:          'meta-llama/llama-3.2-3b-instruct:free',
+    label:       'Llama 3.2 3B',
+    description: 'Fast lightweight fallback — 131K context, lowest rate-limit pressure',
   },
 ];
 
-/** Ordered fallback chain given a chosen primary model ID */
+/** Ordered fallback chain: primary first, then remaining models in list order */
 export function buildFallbackChain(primaryId: string): string[] {
   const others = FREE_MODELS.map(m => m.id).filter(id => id !== primaryId);
   return [primaryId, ...others];

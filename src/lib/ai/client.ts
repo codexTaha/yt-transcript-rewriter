@@ -1,7 +1,6 @@
 /**
  * src/lib/ai/client.ts
- * AI client with automatic 3-model fallback on 429.
- * Supports Anthropic, Gemini, and OpenRouter (default).
+ * AI client with automatic fallback chain on 429 (rate limit) and 404 (no endpoint).
  */
 
 import { buildFallbackChain } from './models';
@@ -9,14 +8,10 @@ import { buildFallbackChain } from './models';
 export interface AIRequestOptions {
   systemPrompt: string;
   userContent:  string;
-  model:        string; // primary model ID — fallbacks tried automatically on 429
+  model:        string;
   maxTokens?:   number;
 }
 
-/**
- * Main entry point.
- * On 429 from OpenRouter it walks the fallback chain before throwing.
- */
 export async function rewriteWithAI(opts: AIRequestOptions): Promise<string> {
   const provider  = (process.env.AI_PROVIDER ?? 'openrouter').toLowerCase();
   const maxTokens = opts.maxTokens ?? parseInt(process.env.AI_MAX_TOKENS ?? '8192', 10);
@@ -24,27 +19,30 @@ export async function rewriteWithAI(opts: AIRequestOptions): Promise<string> {
   if (provider === 'anthropic') return callAnthropic(opts.systemPrompt, opts.userContent, opts.model, maxTokens);
   if (provider === 'gemini')    return callGemini(opts.systemPrompt, opts.userContent, opts.model, maxTokens);
 
-  // OpenRouter — try primary then fallbacks automatically
+  // OpenRouter — walk fallback chain on 429 (rate-limit) OR 404 (model not available)
   const chain = buildFallbackChain(opts.model);
   let lastError: Error | null = null;
+
   for (const modelId of chain) {
     try {
-      const result = await callOpenRouter(opts.systemPrompt, opts.userContent, modelId, maxTokens);
-      return result;
+      return await callOpenRouter(opts.systemPrompt, opts.userContent, modelId, maxTokens);
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err));
-      const is429 = lastError.message.includes('429');
-      if (!is429) throw lastError; // non-rate-limit error — don't try fallbacks
-      console.warn(`[ai/client] 429 on ${modelId}, trying next fallback…`);
+      const msg       = lastError.message;
+      const is429     = msg.includes('429');
+      const is404     = msg.includes('404');   // "No endpoints found" — model unavailable
+      const retryable = is429 || is404;
+      if (!retryable) throw lastError;          // hard error — don’t waste fallbacks
+      console.warn(`[ai/client] ${is404 ? '404 no endpoint' : '429 rate-limit'} on ${modelId}, trying next fallback…`);
     }
   }
-  // All models rate-limited — surface the last 429 so the pump backs off
-  throw lastError ?? new Error('All AI models rate-limited (429)');
+
+  throw lastError ?? new Error('All AI models exhausted (429/404)');
 }
 
-// ── Anthropic ────────────────────────────────────────────────────────────────
+// ── Anthropic ───────────────────────────────────────────────────────────────
 async function callAnthropic(sys: string, user: string, model: string, maxTokens: number): Promise<string> {
-  const apiKey  = process.env.ANTHROPIC_API_KEY ?? '';
+  const apiKey = process.env.ANTHROPIC_API_KEY ?? '';
   if (!apiKey) throw new Error('ANTHROPIC_API_KEY is not set.');
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -76,7 +74,7 @@ async function callGemini(sys: string, user: string, model: string, maxTokens: n
   if (!res.ok) throw new Error(`Gemini ${res.status}: ${(await res.text()).slice(0, 300)}`);
   type R = { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>; error?: { message: string }; promptFeedback?: { blockReason?: string } };
   const data = await res.json() as R;
-  if (data.error)                      throw new Error(`Gemini: ${data.error.message}`);
+  if (data.error)                       throw new Error(`Gemini: ${data.error.message}`);
   if (data.promptFeedback?.blockReason) throw new Error(`Gemini blocked: ${data.promptFeedback.blockReason}`);
   return data.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
 }
@@ -107,17 +105,20 @@ async function callOpenRouter(sys: string, user: string, model: string, maxToken
 
   if (!res.ok) {
     const body = await res.text();
-    // Preserve 429 prefix so callers can detect rate-limit
     if (res.status === 429) throw new Error(`429 Rate limit [${model}]: ${body.slice(0, 200)}`);
+    if (res.status === 404) throw new Error(`404 No endpoint [${model}]: ${body.slice(0, 200)}`);
     throw new Error(`OpenRouter API error ${res.status} [${model}]: ${body.slice(0, 300)}`);
   }
 
-  type R = {
-    choices?: Array<{ message?: { content?: string } }>;
-    error?:   { message: string };
-  };
+  type R = { choices?: Array<{ message?: { content?: string } }>; error?: { message: string } };
   const data = await res.json() as R;
-  if (data.error) throw new Error(`OpenRouter error [${model}]: ${data.error.message}`);
+  if (data.error) {
+    // Some 200-body errors still carry a rate-limit or endpoint message
+    const msg = data.error.message ?? '';
+    if (msg.includes('rate') || msg.includes('429')) throw new Error(`429 Rate limit [${model}]: ${msg}`);
+    if (msg.includes('endpoint') || msg.includes('not a valid model')) throw new Error(`404 No endpoint [${model}]: ${msg}`);
+    throw new Error(`OpenRouter error [${model}]: ${msg}`);
+  }
   const text = data.choices?.[0]?.message?.content;
   if (!text) throw new Error(`OpenRouter returned empty content [${model}]`);
   return text;

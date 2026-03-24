@@ -1,13 +1,29 @@
+/**
+ * POST /api/worker/pump/rewrite
+ *
+ * Free-tier OpenRouter rate limits are very tight (~20 RPM per model, shared
+ * across all users globally). Running 2 parallel workers × 4 fallback models
+ * means up to 8 API calls per poll cycle, which exhausts every free endpoint
+ * simultaneously and causes an endless 429 spiral.
+ *
+ * Strategy:
+ *   - BATCH_SIZE = 1:  only one video rewriting at a time
+ *   - MIN_DISPATCH_GAP_MS: pump will not dispatch a new video if the last
+ *     dispatch happened less than this many ms ago. The client polls every
+ *     ~2 s, so this effectively rate-gates the whole pipeline.
+ */
 import { NextRequest, NextResponse } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import type { ApiResponse } from '@/types';
 
-// Free-tier OpenRouter models have low RPM limits.
-// 2 parallel requests avoids hitting the per-model ceiling;
-// the 3-model fallback chain in ai/client.ts handles any remaining 429s.
-const BATCH_SIZE      = 2;
-const MAX_RETRIES     = 3;
-const PROCESSING_STALE_MS = 90_000;
+const BATCH_SIZE           = 1;
+const MAX_RETRIES          = 3;
+const PROCESSING_STALE_MS  = 120_000;  // 2 min before a stuck "processing" row is recycled
+const MIN_DISPATCH_GAP_MS  = 8_000;    // wait at least 8 s between dispatches
+
+// Module-level last-dispatch timestamp (per process / serverless instance).
+// Resets on cold start, which is fine — cold starts mean idle periods anyway.
+let lastDispatchAt = 0;
 
 export async function POST(req: NextRequest) {
   const admin = createAdminClient();
@@ -100,15 +116,28 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // Dispatch next batch
-    const slots = BATCH_SIZE - (currentProcessing ?? 0);
+    // Rate-gate: don't dispatch a new video until MIN_DISPATCH_GAP_MS has passed
+    const msSinceLast = Date.now() - lastDispatchAt;
+    if (msSinceLast < MIN_DISPATCH_GAP_MS) {
+      return NextResponse.json<ApiResponse>({
+        success: true,
+        data: {
+          processed: 0,
+          remaining: (currentQueued ?? 0) + (currentProcessing ?? 0),
+          waiting:   true,
+          message:   `Dispatch gap: ${Math.ceil((MIN_DISPATCH_GAP_MS - msSinceLast) / 1000)}s remaining`,
+        },
+      });
+    }
+
+    // Dispatch next single video
     const { data: batch } = await admin
       .from('job_videos').select('id, video_id')
       .eq('job_id', job_id).eq('rewrite_status', 'queued')
       .lt('rewrite_retry_count', MAX_RETRIES)
       .or(`rewrite_not_before.is.null,rewrite_not_before.lte.${now}`)
       .order('discovery_position', { ascending: true })
-      .limit(slots);
+      .limit(BATCH_SIZE);
 
     if (!batch || batch.length === 0) {
       return NextResponse.json<ApiResponse>({
@@ -123,6 +152,8 @@ export async function POST(req: NextRequest) {
       rewrite_attempted_at: new Date().toISOString(),
       rewrite_not_before:   null,
     }).in('id', batch.map((v: { id: string }) => v.id));
+
+    lastDispatchAt = Date.now();
 
     const baseUrl = process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000';
     batch.forEach((video: { id: string; video_id: string }) => {

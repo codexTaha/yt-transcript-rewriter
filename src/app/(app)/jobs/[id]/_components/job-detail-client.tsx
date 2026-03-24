@@ -72,6 +72,9 @@ const ACTIVE_STATUSES = new Set([
 
 const TERMINAL_STATUSES = new Set(['completed', 'completed_with_errors', 'failed', 'cancelled']);
 
+// Statuses that should show a modal when TRANSITIONING INTO them
+const MODAL_TRIGGER_STATUSES = new Set(['awaiting_prompt', 'completed', 'completed_with_errors']);
+
 type ModalState = 'none' | 'transcript_complete' | 'prompt' | 'export_ready';
 
 function sleep(ms: number) { return new Promise<void>(r => setTimeout(r, ms)); }
@@ -302,15 +305,16 @@ function RewritePromptModal({ transcriptCount, onSubmit, onBack, submitting }: {
 
 // ─── Main Component ───────────────────────────────────────────────────────────
 //
-// Architecture decision: we use a SINGLE tight polling loop (every 2s while
-// active) as the ONLY source of truth for status transitions. We deliberately
-// do NOT rely on React closure-captured callbacks in pump loops or Realtime
-// events to trigger modals, because those suffer from stale-closure bugs and
-// hot-reload ref-carryover. The poll is a simple setInterval that reads the DB
-// and updates state — dead simple, impossible to miss a transition.
-//
-// The pump functions continue to exist to DRIVE server work (kick off workers),
-// but modal triggering is 100% owned by the polling loop.
+// Modal triggering architecture:
+// - Modals fire ONLY on a genuine status TRANSITION (oldStatus → newStatus).
+// - The first tick seeds statusRef but does NOT trigger a modal, even if the
+//   job is already at awaiting_prompt / completed on page load — the FAB
+//   handles that case instead.
+// - This is the only correct approach under React Strict Mode (which runs
+//   effects twice), because the ref guard would be consumed by the first
+//   mount and silently block the second mount.
+// - txModalShownRef / exportModalShownRef are RESET on every mount so that
+//   a fresh navigation to the page always starts clean.
 
 export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; initialVideos: JobVideo[] }) {
   const router = useRouter();
@@ -320,21 +324,24 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
   const [hydrated, setHydrated] = useState(initialVideos.length > 0);
   const [modal,    setModal]    = useState<ModalState>('none');
 
-  // ── Plain refs (never stale — only read as current values) ────────────────
-  const statusRef            = useRef<string>(initialJob.status as string);
+  // ── Plain refs ────────────────────────────────────────────────────────────
+  // statusRef is seeded to a sentinel so the FIRST tick always looks like a
+  // real transition, letting us fire the pump but NOT the modal.
+  const statusRef            = useRef<string>('');
   const modalRef             = useRef<ModalState>('none');
+  // These are intentionally reset to false every render of the component
+  // (i.e., fresh navigation). Do NOT persist across unmount/remount.
   const txModalShownRef      = useRef<boolean>(false);
   const exportModalShownRef  = useRef<boolean>(false);
   const pumpRunningRef       = useRef<Record<string, boolean>>({});
   const jobIdRef             = useRef<string>(initialJob.id as string);
 
-  // Keep modalRef in sync with modal state
   const setModalSafe = (m: ModalState) => {
     modalRef.current = m;
     setModal(m);
   };
 
-  const [isProcessing,    setIsProcessing]    = useState(ACTIVE_STATUSES.has(initialJob.status as string));
+  const [isProcessing,     setIsProcessing]     = useState(ACTIVE_STATUSES.has(initialJob.status as string));
   const [submittingPrompt, setSubmittingPrompt] = useState(false);
   const [downloading,      setDownloading]      = useState(false);
   const [exportingRaw,     setExportingRaw]     = useState(false);
@@ -344,22 +351,24 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
 
   const jobId = initialJob.id as string;
 
-  // ── triggerModal — the ONLY function that opens stage-transition modals ──
-  // Called exclusively from the polling loop. Checks ref guards so it fires
-  // exactly once per stage, even if called multiple times.
-  function triggerModalForStatus(s: string) {
-    if (s === 'awaiting_prompt' && !txModalShownRef.current) {
+  // ── triggerModal — fires ONLY on genuine transitions ─────────────────────
+  // oldStatus is '' (sentinel) on the first tick so we never fire a modal
+  // just because the page loaded onto an already-actionable status.
+  function triggerModalForTransition(oldStatus: string, newStatus: string) {
+    if (oldStatus === newStatus) return;           // no change — do nothing
+    if (!MODAL_TRIGGER_STATUSES.has(newStatus)) return; // not a modal-worthy status
+
+    if (newStatus === 'awaiting_prompt' && !txModalShownRef.current) {
       txModalShownRef.current = true;
       setModalSafe('transcript_complete');
     }
-    if ((s === 'completed' || s === 'completed_with_errors') && !exportModalShownRef.current) {
+    if ((newStatus === 'completed' || newStatus === 'completed_with_errors') && !exportModalShownRef.current) {
       exportModalShownRef.current = true;
       setModalSafe('export_ready');
     }
   }
 
-  // ── kickPump — fire-and-forget pump driver ────────────────────────────────
-  // Only DRIVES server workers. Does NOT trigger modals. Polling handles that.
+  // ── kickPump ──────────────────────────────────────────────────────────────
   async function kickPump(endpoint: string) {
     if (pumpRunningRef.current[endpoint]) return;
     pumpRunningRef.current[endpoint] = true;
@@ -379,12 +388,12 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
             body:    JSON.stringify({ job_id: jobIdNow }),
           });
           if (res.ok) data = await res.json();
-        } catch { /* network hiccup — keep looping, polling will catch status */ }
+        } catch { /* network hiccup */ }
 
-        if (data?.data?.advanced)                       break; // polling will see new status
-        if ((data?.data?.remaining ?? 1) === 0)         break; // done, polling will see it
-        if (data?.data?.waiting)                        { await sleep(3000); continue; }
-        if (!data)                                      { await sleep(5000); continue; }
+        if (data?.data?.advanced)               break;
+        if ((data?.data?.remaining ?? 1) === 0) break;
+        if (data?.data?.waiting)                { await sleep(3000); continue; }
+        if (!data)                              { await sleep(5000); continue; }
 
         await sleep(1500);
       }
@@ -394,24 +403,19 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
   }
 
   // ── MAIN POLLING LOOP ─────────────────────────────────────────────────────
-  // This is the definitive fix. A simple setInterval that:
-  //  1. Reads the authoritative job status from DB every 2s
-  //  2. Updates React state
-  //  3. Triggers modals on transition
-  //  4. Kicks pumps when status demands it
-  //  5. Stops when terminal AND all expected modals shown
   useEffect(() => {
+    // Reset shown-flags on every mount so strict-mode double-mount starts clean
+    txModalShownRef.current     = false;
+    exportModalShownRef.current = false;
+    // Reset status sentinel so first tick is treated as a transition from nothing
+    statusRef.current = '';
+
     const supabase = createClient();
     let destroyed  = false;
-
-    // Seed initial state
-    statusRef.current = initialJob.status as string;
-    triggerModalForStatus(initialJob.status as string);
 
     const tick = async () => {
       if (destroyed) return;
       try {
-        // ── Fetch job
         const { data: jobData } = await supabase
           .from('jobs')
           .select('*')
@@ -421,26 +425,23 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
         if (!jobData || destroyed) return;
 
         const newStatus = jobData.status as string;
-        const oldStatus = statusRef.current;
+        const oldStatus = statusRef.current;  // '' on very first tick
 
-        // Update state unconditionally so counts/fields stay fresh
+        // Always update state
         statusRef.current = newStatus;
         setJob(jobData as Job);
         setIsProcessing(ACTIVE_STATUSES.has(newStatus));
 
-        // Trigger modal on status change
+        // Fire modal ONLY when status genuinely changed
+        triggerModalForTransition(oldStatus, newStatus);
+
+        // Kick pump on status change
         if (newStatus !== oldStatus) {
-          triggerModalForStatus(newStatus);
-          // Kick pump if new status needs one
-          if (newStatus === 'extracting')                                    kickPump('/api/worker/pump/extract');
+          if (newStatus === 'extracting')                                      kickPump('/api/worker/pump/extract');
           if (newStatus === 'rewriting' || newStatus === 'queued_for_rewrite') kickPump('/api/worker/pump/rewrite');
         }
 
-        // Also trigger modal on FIRST tick if we arrive on an actionable status
-        // (handles page load after job already finished)
-        triggerModalForStatus(newStatus);
-
-        // ── Fetch videos (keep list fresh)
+        // Fetch videos
         const { data: videosData } = await supabase
           .from('job_videos')
           .select('*')
@@ -454,14 +455,13 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
       } catch { /* ignore transient errors */ }
     };
 
-    // First tick immediately, then every 2s
+    // Boot pump for current status on mount (pump is idempotent)
+    const s0 = initialJob.status as string;
+    if (s0 === 'extracting')                                 kickPump('/api/worker/pump/extract');
+    if (s0 === 'rewriting' || s0 === 'queued_for_rewrite')  kickPump('/api/worker/pump/rewrite');
+
     tick();
     const interval = setInterval(tick, 2000);
-
-    // Boot pump for current status on mount
-    const s0 = initialJob.status as string;
-    if (s0 === 'extracting')                                    kickPump('/api/worker/pump/extract');
-    if (s0 === 'rewriting' || s0 === 'queued_for_rewrite')      kickPump('/api/worker/pump/rewrite');
 
     return () => {
       destroyed = true;
@@ -470,7 +470,7 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobId]);
 
-  // ── Also subscribe Realtime for live video row updates (cosmetic only) ────
+  // ── Realtime for live video row updates (cosmetic only) ───────────────────
   useEffect(() => {
     const supabase = createClient();
     const ch = supabase.channel(`job-videos-${jobId}`)
@@ -598,10 +598,10 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
   const handleFABClick = () => {
     if (status === 'awaiting_prompt') {
       txModalShownRef.current = false;
-      triggerModalForStatus('awaiting_prompt');
+      triggerModalForTransition('', 'awaiting_prompt');
     } else if (status === 'completed' || status === 'completed_with_errors') {
       exportModalShownRef.current = false;
-      triggerModalForStatus(status);
+      triggerModalForTransition('', status);
     }
   };
 
@@ -641,7 +641,7 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
         />
       )}
 
-      {/* FAB — Progress button, bottom-right */}
+      {/* FAB — shows when a modal is dismissible and user needs next step */}
       {showFAB && (
         <div className="fixed bottom-6 right-6 z-40">
           <button

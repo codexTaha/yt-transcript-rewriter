@@ -19,7 +19,6 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Stop immediately if job is not extracting
     const { data: job } = await admin
       .from('jobs')
       .select('status')
@@ -33,8 +32,6 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // --- Count current state BEFORE claiming a new batch ---
-    // This is the authoritative snapshot we reason about.
     const { count: currentPending } = await admin
       .from('job_videos')
       .select('*', { count: 'exact', head: true })
@@ -48,7 +45,6 @@ export async function POST(req: NextRequest) {
       .eq('job_id', job_id)
       .eq('transcript_status', 'processing');
 
-    // If nothing pending AND nothing processing — all work is done, advance the job.
     if ((currentPending ?? 0) === 0 && (currentProcessing ?? 0) === 0) {
       const { count: successCount } = await admin
         .from('job_videos')
@@ -62,24 +58,33 @@ export async function POST(req: NextRequest) {
         .eq('job_id', job_id)
         .in('transcript_status', ['failed', 'skipped']);
 
+      const success = successCount ?? 0;
+      const failed  = failedCount  ?? 0;
+
+      // If ZERO transcripts succeeded, mark the job as failed instead of
+      // advancing to awaiting_prompt (which would show a useless modal).
+      const nextStatus = success === 0 ? 'failed' : 'awaiting_prompt';
+      const errorMsg   = success === 0
+        ? `All ${failed} transcript extractions failed. YouTube may be blocking your IP — try adding a PROXY_URL in .env.local.`
+        : undefined;
+
       await admin
         .from('jobs')
         .update({
-          status: 'awaiting_prompt',
-          transcript_success_count: successCount ?? 0,
-          transcript_failed_count: failedCount ?? 0,
+          status: nextStatus,
+          transcript_success_count: success,
+          transcript_failed_count:  failed,
+          ...(errorMsg ? { error_message: errorMsg } : {}),
         })
         .eq('id', job_id)
-        // Only advance if still in extracting — guard against concurrent calls
         .eq('status', 'extracting');
 
       return NextResponse.json<ApiResponse>({
         success: true,
-        data: { processed: 0, remaining: 0, advanced: true, next_status: 'awaiting_prompt' },
+        data: { processed: 0, remaining: 0, advanced: true, next_status: nextStatus },
       });
     }
 
-    // If nothing pending but some still processing — wait for them
     if ((currentPending ?? 0) === 0 && (currentProcessing ?? 0) > 0) {
       return NextResponse.json<ApiResponse>({
         success: true,
@@ -87,7 +92,6 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // Claim next batch of pending videos
     const { data: batch } = await admin
       .from('job_videos')
       .select('id, video_id')
@@ -98,35 +102,31 @@ export async function POST(req: NextRequest) {
       .limit(BATCH_SIZE);
 
     if (!batch || batch.length === 0) {
-      // Pending disappeared between count and select (race) — return remaining
       return NextResponse.json<ApiResponse>({
         success: true,
         data: { processed: 0, remaining: (currentProcessing ?? 0) },
       });
     }
 
-    // Mark batch as processing
     await admin
       .from('job_videos')
       .update({
-        transcript_status: 'processing',
-        transcript_attempted_at: new Date().toISOString(),
+        transcript_status:        'processing',
+        transcript_attempted_at:  new Date().toISOString(),
       })
       .in('id', batch.map(v => v.id));
 
-    // Dispatch all in parallel — fire and forget per video
     const baseUrl = process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000';
     await Promise.allSettled(
       batch.map(video =>
         fetch(`${baseUrl}/api/worker/extract`, {
-          method: 'POST',
+          method:  'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ job_id, job_video_id: video.id, video_id: video.video_id }),
+          body:    JSON.stringify({ job_id, job_video_id: video.id, video_id: video.video_id }),
         })
       )
     );
 
-    // After batch completes, count what is TRULY still outstanding
     const { count: pendingAfter } = await admin
       .from('job_videos')
       .select('*', { count: 'exact', head: true })
@@ -139,11 +139,9 @@ export async function POST(req: NextRequest) {
       .eq('job_id', job_id)
       .eq('transcript_status', 'processing');
 
-    const remaining = (pendingAfter ?? 0) + (processingAfter ?? 0);
-
     return NextResponse.json<ApiResponse>({
       success: true,
-      data: { processed: batch.length, remaining },
+      data: { processed: batch.length, remaining: (pendingAfter ?? 0) + (processingAfter ?? 0) },
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Pump failed';

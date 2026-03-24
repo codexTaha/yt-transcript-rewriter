@@ -13,27 +13,42 @@ export async function updateSession(request: NextRequest) {
           return request.cookies.getAll();
         },
         setAll(cookiesToSet) {
+          // CRITICAL: do NOT re-create supabaseResponse here.
+          // Re-creating it drops cookies set by earlier middleware.
           cookiesToSet.forEach(({ name, value }) =>
             request.cookies.set(name, value)
           );
+          // Re-create response only to attach cookies to the outgoing response
           supabaseResponse = NextResponse.next({ request });
-          cookiesToSet.forEach(({ name, value, options }) =>
-            supabaseResponse.cookies.set(name, value, options)
-          );
-        }
-      }
+          cookiesToSet.forEach(({ name, value, options }) => {
+            // Persist session cookies for the entire browser session (until tab close)
+            const opts = {
+              ...options,
+              // Remove maxAge/expires so cookie becomes session-scoped
+              maxAge: undefined,
+              expires: undefined,
+              sameSite: 'lax' as const,
+              httpOnly: true,
+              path: '/',
+            };
+            supabaseResponse.cookies.set(name, value, opts);
+          });
+        },
+      },
     }
   );
 
-  // Refresh session if expired
-  const { data: { user } } = await supabase.auth.getUser();
+  // Refresh the session token if it is close to expiry
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
 
-  // Protect dashboard and job routes
-  const isProtectedRoute =
+  // Protect /dashboard and /jobs routes
+  const isProtected =
     request.nextUrl.pathname.startsWith('/dashboard') ||
     request.nextUrl.pathname.startsWith('/jobs');
 
-  if (isProtectedRoute && !user) {
+  if (isProtected && !user) {
     const url = request.nextUrl.clone();
     url.pathname = '/auth';
     return NextResponse.redirect(url);

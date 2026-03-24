@@ -1,43 +1,69 @@
-import Link from 'next/link';
-import { createClient } from '@/lib/supabase/server';
-import { LogOut, Youtube } from 'lucide-react';
+'use client';
 
-export async function Navbar() {
-  const supabase = await createClient();
-  const { data: { user } } = await supabase.auth.getUser();
+import Link from 'next/link';
+import { useRouter } from 'next/navigation';
+import { Youtube, Moon, Sun, LayoutDashboard, LogIn } from 'lucide-react';
+import { useTheme } from '@/components/theme-provider';
+
+export function Navbar({ isLoggedIn }: { isLoggedIn: boolean }) {
+  const { theme, toggle } = useTheme();
+  const router = useRouter();
+
+  const handleSignOut = async () => {
+    const res = await fetch('/api/auth/signout', { method: 'POST' });
+    if (res.ok) {
+      router.push('/auth');
+      router.refresh();
+    }
+  };
 
   return (
-    <header className="border-b border-border bg-card/50 backdrop-blur-sm sticky top-0 z-50">
+    <header className="border-b border-border bg-card/80 backdrop-blur-md sticky top-0 z-50">
       <div className="max-w-6xl mx-auto px-4 h-14 flex items-center justify-between">
-        <Link href="/" className="flex items-center gap-2 font-semibold text-foreground hover:text-primary transition-colors">
-          <Youtube className="h-5 w-5 text-primary" />
+        {/* Logo */}
+        <Link
+          href="/"
+          className="flex items-center gap-2 font-bold text-foreground hover:text-primary transition-colors"
+        >
+          <div className="h-7 w-7 rounded-lg bg-primary/10 flex items-center justify-center">
+            <Youtube className="h-4 w-4 text-primary" />
+          </div>
           <span>YT Rewriter</span>
         </Link>
 
-        <nav className="flex items-center gap-4">
-          {user ? (
+        {/* Right nav */}
+        <nav className="flex items-center gap-2">
+          {/* Dark / Light toggle */}
+          <button
+            onClick={toggle}
+            title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+            className="h-9 w-9 rounded-lg border border-border bg-card flex items-center justify-center text-muted-foreground hover:text-foreground hover:border-primary/40 transition-all"
+          >
+            {theme === 'dark' ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+          </button>
+
+          {isLoggedIn ? (
             <>
               <Link
                 href="/dashboard"
-                className="text-sm text-muted-foreground hover:text-foreground transition-colors"
+                className="inline-flex items-center gap-1.5 h-9 px-4 rounded-lg border border-border bg-card text-sm font-medium text-foreground hover:bg-primary/10 hover:border-primary/50 hover:text-primary transition-all"
               >
+                <LayoutDashboard className="h-3.5 w-3.5" />
                 Dashboard
               </Link>
-              <form action="/api/auth/signout" method="POST">
-                <button
-                  type="submit"
-                  className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors"
-                >
-                  <LogOut className="h-4 w-4" />
-                  Sign out
-                </button>
-              </form>
+              <button
+                onClick={handleSignOut}
+                className="inline-flex items-center gap-1.5 h-9 px-4 rounded-lg border border-border bg-card text-sm font-medium text-muted-foreground hover:text-destructive hover:border-destructive/50 hover:bg-destructive/10 transition-all"
+              >
+                Sign out
+              </button>
             </>
           ) : (
             <Link
               href="/auth"
-              className="text-sm text-primary hover:text-primary/80 transition-colors font-medium"
+              className="inline-flex items-center gap-1.5 h-9 px-4 rounded-lg bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-all shadow-sm"
             >
+              <LogIn className="h-3.5 w-3.5" />
               Sign in
             </Link>
           )}

@@ -7,7 +7,7 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { toast } from 'sonner';
-import { Loader2, X, FileText, Trash2 } from 'lucide-react';
+import { Loader2, X, FileText, Trash2, Download, Pencil } from 'lucide-react';
 
 type Job = Record<string, unknown>;
 type JobVideo = Record<string, unknown>;
@@ -63,94 +63,195 @@ const CANCELLABLE_STATUSES = [
   'awaiting_prompt', 'queued_for_rewrite', 'rewriting', 'building_export',
 ];
 
-// Status transitions the pump tells us about — used for optimistic UI updates
-const PUMP_NEXT_STATUS: Record<string, string> = {
-  awaiting_prompt: 'awaiting_prompt',
-  building_export: 'building_export',
-};
-
-// ─── Transcript Modal ─────────────────────────────────────────────────────────
+// ─── Transcript Viewer Modal ──────────────────────────────────────────────────
 
 function TranscriptModal({
-  jobId,
-  video,
-  onClose,
-}: {
-  jobId: string;
-  video: JobVideo;
-  onClose: () => void;
-}) {
-  const [text, setText] = useState<string | null>(null);
+  jobId, video, onClose,
+}: { jobId: string; video: JobVideo; onClose: () => void }) {
+  const [text,    setText]    = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [error,   setError]   = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     fetch(`/api/jobs/${jobId}/transcript?video_id=${video.video_id as string}`)
       .then(r => r.json())
-      .then(data => {
-        if (cancelled) return;
-        if (data.success) setText(data.data.text as string);
-        else setError((data.error as string) ?? 'Failed to load transcript');
-      })
+      .then(d => { if (!cancelled) { if (d.success) setText(d.data.text as string); else setError((d.error as string) ?? 'Failed'); } })
       .catch(() => { if (!cancelled) setError('Network error'); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
   }, [jobId, video.video_id]);
 
   useEffect(() => {
-    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
+    const h = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', h);
+    return () => window.removeEventListener('keydown', h);
   }, [onClose]);
-
-  const handleCopy = () => {
-    if (!text) return;
-    navigator.clipboard.writeText(text);
-    toast.success('Copied to clipboard');
-  };
 
   const wordCount = typeof video.transcript_word_count === 'number' ? video.transcript_word_count as number : null;
   const language  = typeof video.transcript_language  === 'string' ? (video.transcript_language as string).toUpperCase() : null;
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
-      onClick={e => { if (e.target === e.currentTarget) onClose(); }}
-    >
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
       <div className="relative bg-card border border-border rounded-xl shadow-2xl w-full max-w-3xl mx-4 flex flex-col max-h-[85vh]">
         <div className="flex items-start justify-between gap-4 px-6 py-4 border-b border-border shrink-0">
           <div className="min-w-0">
-            <h2 className="font-semibold text-foreground truncate">
-              {(video.video_title as string) || (video.video_id as string)}
-            </h2>
+            <h2 className="font-semibold text-foreground truncate">{(video.video_title as string) || (video.video_id as string)}</h2>
             <div className="flex items-center gap-3 mt-1 text-xs text-muted-foreground">
               {wordCount !== null && <span>{wordCount.toLocaleString()} words</span>}
               {language  !== null && <span>Language: {language}</span>}
             </div>
           </div>
           <div className="flex items-center gap-2 shrink-0">
-            <Button size="sm" variant="outline" onClick={handleCopy} disabled={!text}>Copy</Button>
-            <button
-              onClick={onClose}
-              className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
-            >
-              <X className="h-4 w-4" />
-            </button>
+            <Button size="sm" variant="outline" onClick={() => { if (text) { navigator.clipboard.writeText(text); toast.success('Copied'); } }} disabled={!text}>Copy</Button>
+            <button onClick={onClose} className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"><X className="h-4 w-4" /></button>
           </div>
         </div>
         <div className="overflow-y-auto flex-1 px-6 py-4">
-          {loading && (
-            <div className="flex items-center justify-center py-16">
-              <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+          {loading && <div className="flex items-center justify-center py-16"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>}
+          {!loading && error && <p className="text-sm text-destructive py-8 text-center">{error}</p>}
+          {!loading && text && <pre className="text-sm text-foreground whitespace-pre-wrap font-mono leading-relaxed">{text}</pre>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Completion Choice Modal ──────────────────────────────────────────────────
+// Shown when extraction finishes. User picks: rewrite with AI or export raw .txt
+
+function CompletionModal({
+  transcriptCount,
+  onRewrite,
+  onExportRaw,
+  onDismiss,
+}: {
+  transcriptCount: number;
+  onRewrite:   () => void;
+  onExportRaw: () => void;
+  onDismiss:   () => void;
+}) {
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => { if (e.key === 'Escape') onDismiss(); };
+    window.addEventListener('keydown', h);
+    return () => window.removeEventListener('keydown', h);
+  }, [onDismiss]);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      onClick={e => { if (e.target === e.currentTarget) onDismiss(); }}>
+      <div className="bg-card border border-border rounded-xl shadow-2xl w-full max-w-md mx-4">
+        {/* Header */}
+        <div className="flex items-start justify-between gap-4 px-6 pt-6 pb-4">
+          <div>
+            <h2 className="text-lg font-semibold text-foreground">Extraction complete ✅</h2>
+            <p className="text-sm text-muted-foreground mt-1">
+              <strong>{transcriptCount}</strong> transcript{transcriptCount !== 1 ? 's' : ''} extracted successfully.
+              What would you like to do next?
+            </p>
+          </div>
+          <button onClick={onDismiss} className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors shrink-0">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        {/* Options */}
+        <div className="px-6 pb-6 flex flex-col gap-3">
+          {/* Rewrite with AI */}
+          <button
+            onClick={onRewrite}
+            className="w-full flex items-start gap-4 p-4 rounded-lg border border-border bg-background hover:border-primary/60 hover:bg-primary/5 transition-all text-left group"
+          >
+            <div className="mt-0.5 p-2 rounded-md bg-primary/10 text-primary shrink-0">
+              <Pencil className="h-4 w-4" />
             </div>
-          )}
-          {!loading && error && (
-            <p className="text-sm text-destructive py-8 text-center">{error}</p>
-          )}
-          {!loading && text && (
-            <pre className="text-sm text-foreground whitespace-pre-wrap font-mono leading-relaxed">{text}</pre>
-          )}
+            <div>
+              <p className="font-medium text-foreground group-hover:text-primary transition-colors">Rewrite with AI</p>
+              <p className="text-sm text-muted-foreground mt-0.5">
+                Enter a prompt and let AI rewrite all transcripts. Download as a Markdown bundle when done.
+              </p>
+            </div>
+          </button>
+
+          {/* Export raw */}
+          <button
+            onClick={onExportRaw}
+            className="w-full flex items-start gap-4 p-4 rounded-lg border border-border bg-background hover:border-primary/60 hover:bg-primary/5 transition-all text-left group"
+          >
+            <div className="mt-0.5 p-2 rounded-md bg-muted text-muted-foreground shrink-0">
+              <Download className="h-4 w-4" />
+            </div>
+            <div>
+              <p className="font-medium text-foreground group-hover:text-primary transition-colors">Export raw transcripts</p>
+              <p className="text-sm text-muted-foreground mt-0.5">
+                Download all transcripts as a single <code className="font-mono text-xs">.txt</code> file, separated by video title and divider.
+              </p>
+            </div>
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Rewrite Prompt Modal ────────────────────────────────────────────────────
+// Shown after user clicks "Rewrite with AI" in the CompletionModal
+
+function RewritePromptModal({
+  transcriptCount,
+  onSubmit,
+  onBack,
+  submitting,
+}: {
+  transcriptCount: number;
+  onSubmit:   (prompt: string) => void;
+  onBack:     () => void;
+  submitting: boolean;
+}) {
+  const [prompt, setPrompt] = useState('');
+
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => { if (e.key === 'Escape') onBack(); };
+    window.addEventListener('keydown', h);
+    return () => window.removeEventListener('keydown', h);
+  }, [onBack]);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+      <div className="bg-card border border-border rounded-xl shadow-2xl w-full max-w-lg mx-4">
+        <div className="flex items-center justify-between gap-4 px-6 pt-6 pb-4">
+          <div>
+            <h2 className="text-lg font-semibold text-foreground">AI Rewrite Prompt</h2>
+            <p className="text-sm text-muted-foreground mt-0.5">
+              Applied to all <strong>{transcriptCount}</strong> transcript{transcriptCount !== 1 ? 's' : ''}.
+            </p>
+          </div>
+          <button onClick={onBack} className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors shrink-0">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="px-6 pb-6">
+          <Textarea
+            autoFocus
+            placeholder="e.g. Rewrite this YouTube transcript as a clean, engaging blog post. Remove filler words and timestamps. Use markdown headings."
+            value={prompt}
+            onChange={e => setPrompt(e.target.value)}
+            rows={6}
+            className="mb-4 resize-none"
+          />
+          <div className="flex items-center gap-3 justify-end">
+            <Button variant="outline" onClick={onBack} disabled={submitting}>Back</Button>
+            <Button
+              onClick={() => onSubmit(prompt)}
+              disabled={submitting || !prompt.trim()}
+            >
+              {submitting
+                ? <><Loader2 className="h-4 w-4 animate-spin mr-2" />Submitting…</>
+                : `Rewrite ${transcriptCount} transcript${transcriptCount !== 1 ? 's' : ''}`}
+            </Button>
+          </div>
         </div>
       </div>
     </div>
@@ -158,6 +259,8 @@ function TranscriptModal({
 }
 
 // ─── Main Component ───────────────────────────────────────────────────────────
+
+type ModalState = 'none' | 'completion' | 'prompt';
 
 export function JobDetailClient({
   job: initialJob,
@@ -170,121 +273,86 @@ export function JobDetailClient({
 
   const [job,    setJob]    = useState<Job>(initialJob);
   const [videos, setVideos] = useState<JobVideo[]>(initialVideos);
-
-  // hydrated = we have a definitive video list from client-side fetch or realtime
   const [hydrated, setHydrated] = useState(initialVideos.length > 0);
 
-  const [prompt,           setPrompt]           = useState('');
+  // Modal state machine: none → completion → prompt (or none after export raw)
+  const [modal, setModal] = useState<ModalState>('none');
+  // Track whether we already auto-opened the completion modal for this session
+  const completionShown = useRef(false);
+
   const [submittingPrompt, setSubmittingPrompt] = useState(false);
   const [downloading,      setDownloading]      = useState(false);
+  const [exportingRaw,     setExportingRaw]     = useState(false);
   const [cancelling,       setCancelling]       = useState(false);
   const [deleting,         setDeleting]         = useState(false);
   const [viewingVideo,     setViewingVideo]     = useState<JobVideo | null>(null);
 
-  // pumpRunning prevents concurrent pump loops for the same endpoint
   const pumpRunning = useRef<Record<string, boolean>>({});
-  // statusRef mirrors job.status — readable synchronously inside async loops
-  const statusRef = useRef<string>(initialJob.status as string);
+  const statusRef   = useRef<string>(initialJob.status as string);
 
   const jobId  = job.id     as string;
   const status = job.status as string;
 
-  // Keep statusRef always in sync
+  useEffect(() => { statusRef.current = status; }, [status]);
+
+  // ── Auto-open completion modal when status transitions to awaiting_prompt ──
   useEffect(() => {
-    statusRef.current = status;
+    if (status === 'awaiting_prompt' && !completionShown.current) {
+      completionShown.current = true;
+      setModal('completion');
+    }
   }, [status]);
 
-  // ── Mount fetch: always re-load from DB on client-side navigation ──────────
-  // (SSR data may be stale if the user navigated here via next/link)
+  // ── Mount fetch ──
   useEffect(() => {
     const supabase = createClient();
     let active = true;
 
-    supabase
-      .from('jobs')
-      .select('*')
-      .eq('id', jobId)
-      .single()
+    supabase.from('jobs').select('*').eq('id', jobId).single()
       .then(({ data }) => { if (active && data) setJob(data as Job); });
 
-    supabase
-      .from('job_videos')
-      .select('*')
-      .eq('job_id', jobId)
+    supabase.from('job_videos').select('*').eq('job_id', jobId)
       .order('discovery_position', { ascending: true })
       .then(({ data }) => {
         if (!active) return;
-        if (data) {
-          setVideos(data as JobVideo[]);
-          setHydrated(true);
-        }
+        if (data) { setVideos(data as JobVideo[]); setHydrated(true); }
       });
 
     return () => { active = false; };
   }, [jobId]);
 
-  // ── Realtime subscriptions ─────────────────────────────────────────────────
+  // ── Realtime ──
   useEffect(() => {
     const supabase = createClient();
-
     const channel = supabase
       .channel(`job-detail-${jobId}`)
-      // Job row updates
-      .on(
-        'postgres_changes',
-        { event: 'UPDATE', schema: 'public', table: 'jobs', filter: `id=eq.${jobId}` },
-        payload => setJob(payload.new as Job)
-      )
-      // Video row changes
-      .on(
-        'postgres_changes',
-        { event: 'INSERT', schema: 'public', table: 'job_videos', filter: `job_id=eq.${jobId}` },
-        payload => {
-          setVideos(prev => {
-            if (prev.some(v => (v.id as string) === (payload.new.id as string))) return prev;
-            return [...prev, payload.new as JobVideo];
-          });
-          // First INSERT proves videos exist — resolve the loading state
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'jobs', filter: `id=eq.${jobId}` },
+        p => setJob(p.new as Job))
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'job_videos', filter: `job_id=eq.${jobId}` },
+        p => {
+          setVideos(prev => prev.some(v => (v.id as string) === (p.new.id as string)) ? prev : [...prev, p.new as JobVideo]);
           setHydrated(true);
-        }
-      )
-      .on(
-        'postgres_changes',
-        { event: 'UPDATE', schema: 'public', table: 'job_videos', filter: `job_id=eq.${jobId}` },
-        payload =>
-          setVideos(prev =>
-            prev.map(v =>
-              (v.id as string) === (payload.new.id as string) ? (payload.new as JobVideo) : v
-            )
-          )
-      )
-      .on(
-        'postgres_changes',
-        { event: 'DELETE', schema: 'public', table: 'job_videos', filter: `job_id=eq.${jobId}` },
-        payload =>
-          setVideos(prev => prev.filter(v => (v.id as string) !== (payload.old.id as string)))
-      )
+        })
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'job_videos', filter: `job_id=eq.${jobId}` },
+        p => setVideos(prev => prev.map(v => (v.id as string) === (p.new.id as string) ? p.new as JobVideo : v)))
+      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'job_videos', filter: `job_id=eq.${jobId}` },
+        p => setVideos(prev => prev.filter(v => (v.id as string) !== (p.old.id as string))))
       .subscribe();
-
     return () => { supabase.removeChannel(channel); };
   }, [jobId]);
 
-  // ── Pump loop ──────────────────────────────────────────────────────────────
+  // ── Pump ──
   const pump = useCallback(async (endpoint: string) => {
     if (pumpRunning.current[endpoint]) return;
     pumpRunning.current[endpoint] = true;
-
     try {
       while (true) {
         const current = statusRef.current;
-
-        // Hard stop conditions
         if (current === 'cancelled' || current === 'failed') break;
         if (endpoint.includes('extract') && current !== 'extracting') break;
         if (endpoint.includes('rewrite') && current !== 'rewriting') break;
 
         let data: { success: boolean; data?: { remaining?: number; advanced?: boolean; next_status?: string; waiting?: boolean } };
-
         try {
           const res = await fetch(endpoint, {
             method: 'POST',
@@ -293,31 +361,23 @@ export function JobDetailClient({
           });
           if (!res.ok) break;
           data = await res.json();
-        } catch {
-          break; // network error
-        }
+        } catch { break; }
 
-        // Server confirmed job advanced — optimistically update the UI immediately
-        // so the badge and prompt box don't wait on a (potentially slow) realtime event
-        if (data?.data?.advanced && data.data.next_status) {
-          const nextStatus = data.data.next_status;
-          statusRef.current = nextStatus; // update ref synchronously before setJob re-render
-          setJob(prev => ({ ...prev, status: nextStatus }));
+        if (data?.data?.advanced) {
+          const next = data.data.next_status;
+          if (next) {
+            statusRef.current = next;
+            setJob(prev => ({ ...prev, status: next }));
+          }
           break;
         }
 
-        if (data?.data?.advanced) break; // advanced but no next_status hint
-
-        const remaining = data?.data?.remaining ?? 0;
-
-        // If we're in "waiting" mode (batch dispatched, some still processing),
-        // keep polling but with a longer backoff to avoid hammering the DB
         if (data?.data?.waiting) {
           await new Promise<void>(r => setTimeout(r, 3000));
           continue;
         }
 
-        if (remaining <= 0) break;
+        if ((data?.data?.remaining ?? 0) <= 0) break;
         await new Promise<void>(r => setTimeout(r, 2000));
       }
     } finally {
@@ -325,26 +385,25 @@ export function JobDetailClient({
     }
   }, [jobId]);
 
-  // Auto-start pump when status becomes active
   useEffect(() => {
     if (status === 'extracting') pump('/api/worker/pump/extract');
     else if (status === 'rewriting') pump('/api/worker/pump/rewrite');
   }, [status, pump]);
 
-  // ── Action handlers ────────────────────────────────────────────────────────
+  // ── Action handlers ──
 
-  const handleSubmitPrompt = async () => {
-    if (!prompt.trim()) { toast.error('Please enter a prompt'); return; }
+  const handleSubmitPrompt = async (promptText: string) => {
     setSubmittingPrompt(true);
     try {
       const res = await fetch(`/api/jobs/${jobId}/prompt`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ master_prompt: prompt }),
+        body: JSON.stringify({ master_prompt: promptText }),
       });
       const data = await res.json();
       if (!data.success) throw new Error((data.error as string) ?? 'Unknown error');
-      toast.success(`Queued ${(data.data.queued_count as number)} videos for rewriting`);
+      toast.success(`Queued ${data.data.queued_count as number} videos for rewriting`);
+      setModal('none');
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Failed to submit prompt');
     } finally {
@@ -352,7 +411,26 @@ export function JobDetailClient({
     }
   };
 
-  const handleDownload = async () => {
+  const handleExportRaw = async () => {
+    setExportingRaw(true);
+    setModal('none');
+    try {
+      // Trigger a direct browser download via anchor click
+      const a = document.createElement('a');
+      a.href = `/api/jobs/${jobId}/export-transcripts`;
+      a.download = '';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      toast.success('Download started');
+    } catch {
+      toast.error('Failed to start download');
+    } finally {
+      setExportingRaw(false);
+    }
+  };
+
+  const handleDownloadRewritten = async () => {
     setDownloading(true);
     try {
       const res = await fetch(`/api/jobs/${jobId}/download`);
@@ -376,6 +454,7 @@ export function JobDetailClient({
       toast.success('Job cancelled');
       statusRef.current = 'cancelled';
       setJob(prev => ({ ...prev, status: 'cancelled' }));
+      setModal('none');
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Failed to cancel job');
     } finally {
@@ -398,25 +477,39 @@ export function JobDetailClient({
     }
   };
 
-  // ── Derived values ─────────────────────────────────────────────────────────
-
+  // ── Derived ──
   const transcriptDone = videos.filter(v => v.transcript_status === 'done').length;
   const rewriteDone    = videos.filter(v => v.rewrite_status    === 'done').length;
-  const totalVideos    = hydrated
-    ? videos.length
-    : ((job.total_video_count as number) || 0);
+  const totalVideos    = hydrated ? videos.length : ((job.total_video_count as number) || 0);
   const isCancellable  = CANCELLABLE_STATUSES.includes(status);
   const isActive       = ['discovering', 'extracting', 'rewriting', 'building_export'].includes(status);
 
-  // ── Render ─────────────────────────────────────────────────────────────────
+  // ── Render ──
 
   return (
     <>
+      {/* Transcript viewer */}
       {viewingVideo && (
-        <TranscriptModal
-          jobId={jobId}
-          video={viewingVideo}
-          onClose={() => setViewingVideo(null)}
+        <TranscriptModal jobId={jobId} video={viewingVideo} onClose={() => setViewingVideo(null)} />
+      )}
+
+      {/* Completion modal — choose rewrite or export raw */}
+      {modal === 'completion' && (
+        <CompletionModal
+          transcriptCount={transcriptDone}
+          onRewrite={() => setModal('prompt')}
+          onExportRaw={handleExportRaw}
+          onDismiss={() => setModal('none')}
+        />
+      )}
+
+      {/* Rewrite prompt modal */}
+      {modal === 'prompt' && (
+        <RewritePromptModal
+          transcriptCount={transcriptDone}
+          onSubmit={handleSubmitPrompt}
+          onBack={() => setModal('completion')}
+          submitting={submittingPrompt}
         />
       )}
 
@@ -433,36 +526,30 @@ export function JobDetailClient({
               <h1 className="text-2xl font-bold text-foreground truncate">
                 {(job.source_name as string) || 'Loading...'}
               </h1>
-              <p className="text-muted-foreground text-sm mt-1 truncate">
-                {job.source_url as string}
-              </p>
+              <p className="text-muted-foreground text-sm mt-1 truncate">{job.source_url as string}</p>
             </div>
             <div className="flex items-center gap-2 shrink-0 flex-wrap justify-end">
               <Badge variant={STATUS_VARIANTS[status] ?? 'secondary'}>
                 {isActive && <Loader2 className="h-3 w-3 animate-spin mr-1.5 inline" />}
                 {STATUS_LABELS[status] ?? status}
               </Badge>
-              {isCancellable && (
-                <Button
-                  variant="outline" size="sm"
-                  onClick={handleCancel}
-                  disabled={cancelling || deleting}
-                  className="text-destructive border-destructive/40 hover:bg-destructive/10 hover:text-destructive"
-                >
-                  {cancelling
-                    ? <><Loader2 className="h-3 w-3 animate-spin mr-1" />Cancelling</>
-                    : 'Cancel'}
+
+              {/* Re-open completion modal if awaiting_prompt and modal was dismissed */}
+              {status === 'awaiting_prompt' && modal === 'none' && transcriptDone > 0 && (
+                <Button variant="outline" size="sm" onClick={() => setModal('completion')}>
+                  <Pencil className="h-3.5 w-3.5 mr-1.5" />What’s next?
                 </Button>
               )}
-              <Button
-                variant="outline" size="sm"
-                onClick={handleDelete}
-                disabled={deleting || cancelling}
-                className="text-destructive border-destructive/40 hover:bg-destructive/10 hover:text-destructive"
-              >
-                {deleting
-                  ? <><Loader2 className="h-3 w-3 animate-spin mr-1" />Deleting</>
-                  : <><Trash2 className="h-3.5 w-3.5 mr-1" />Delete</>}
+
+              {isCancellable && (
+                <Button variant="outline" size="sm" onClick={handleCancel} disabled={cancelling || deleting}
+                  className="text-destructive border-destructive/40 hover:bg-destructive/10 hover:text-destructive">
+                  {cancelling ? <><Loader2 className="h-3 w-3 animate-spin mr-1" />Cancelling</> : 'Cancel'}
+                </Button>
+              )}
+              <Button variant="outline" size="sm" onClick={handleDelete} disabled={deleting || cancelling}
+                className="text-destructive border-destructive/40 hover:bg-destructive/10 hover:text-destructive">
+                {deleting ? <><Loader2 className="h-3 w-3 animate-spin mr-1" />Deleting</> : <><Trash2 className="h-3.5 w-3.5 mr-1" />Delete</>}
               </Button>
             </div>
           </div>
@@ -477,69 +564,50 @@ export function JobDetailClient({
             </div>
             <div className="bg-card border border-border rounded-lg p-5">
               <div className="text-2xl font-bold text-foreground">
-                {transcriptDone}
-                <span className="text-muted-foreground font-normal text-lg"> / {totalVideos}</span>
+                {transcriptDone}<span className="text-muted-foreground font-normal text-lg"> / {totalVideos}</span>
               </div>
               <div className="text-sm text-muted-foreground mt-1">Transcripts</div>
             </div>
             <div className="bg-card border border-border rounded-lg p-5">
               <div className="text-2xl font-bold text-foreground">
-                {rewriteDone}
-                <span className="text-muted-foreground font-normal text-lg"> / {totalVideos}</span>
+                {rewriteDone}<span className="text-muted-foreground font-normal text-lg"> / {totalVideos}</span>
               </div>
               <div className="text-sm text-muted-foreground mt-1">Rewritten</div>
             </div>
           </div>
 
-          {/* Cancelled notice */}
+          {/* Cancelled */}
           {status === 'cancelled' && (
             <div className="bg-muted/40 border border-border rounded-lg p-5 mb-8">
               <p className="font-medium text-foreground">Job cancelled</p>
               <p className="text-sm text-muted-foreground mt-1">
                 {transcriptDone > 0
-                  ? `${transcriptDone} transcript(s) were extracted before cancellation.`
+                  ? `${transcriptDone} transcript(s) were extracted before cancellation. You can still export them.`
                   : 'No transcripts were extracted.'}
               </p>
+              {transcriptDone > 0 && (
+                <Button size="sm" variant="outline" className="mt-3" onClick={handleExportRaw} disabled={exportingRaw}>
+                  {exportingRaw ? <><Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />Preparing…</> : <><Download className="h-3.5 w-3.5 mr-1.5" />Export transcripts</>}
+                </Button>
+              )}
             </div>
           )}
 
-          {/* Prompt box — only when status is confirmed awaiting_prompt AND we have transcripts */}
-          {status === 'awaiting_prompt' && transcriptDone > 0 && (
-            <div className="bg-card border border-border rounded-lg p-6 mb-8">
-              <h2 className="text-lg font-semibold text-foreground mb-1">Enter your rewrite prompt</h2>
-              <p className="text-sm text-muted-foreground mb-4">
-                Applied to all <strong>{transcriptDone}</strong> extracted transcript{transcriptDone !== 1 ? 's' : ''}.
-              </p>
-              <Textarea
-                placeholder="e.g. Rewrite this YouTube transcript as a clean, engaging blog post. Remove filler words and timestamps. Use markdown headings."
-                value={prompt}
-                onChange={e => setPrompt(e.target.value)}
-                className="mb-4"
-                rows={5}
-              />
-              <Button
-                onClick={handleSubmitPrompt}
-                disabled={submittingPrompt || !prompt.trim()}
-              >
-                {submittingPrompt
-                  ? <><Loader2 className="h-4 w-4 animate-spin mr-2" />Submitting...</>
-                  : `Rewrite ${transcriptDone} transcript${transcriptDone !== 1 ? 's' : ''}`}
-              </Button>
-            </div>
-          )}
-
-          {/* Download */}
+          {/* Rewritten export ready */}
           {(status === 'completed' || status === 'completed_with_errors') && (
             <div className="bg-card border border-border rounded-lg p-6 mb-8">
               <h2 className="text-lg font-semibold text-foreground mb-1">Export ready</h2>
               <p className="text-sm text-muted-foreground mb-4">
                 {rewriteDone} video{rewriteDone !== 1 ? 's' : ''} rewritten successfully.
               </p>
-              <Button onClick={handleDownload} disabled={downloading}>
-                {downloading
-                  ? <><Loader2 className="h-4 w-4 animate-spin mr-2" />Generating...</>
-                  : '⬇ Download Markdown Bundle'}
-              </Button>
+              <div className="flex items-center gap-3 flex-wrap">
+                <Button onClick={handleDownloadRewritten} disabled={downloading}>
+                  {downloading ? <><Loader2 className="h-4 w-4 animate-spin mr-2" />Generating…</> : '⬇ Download Markdown Bundle'}
+                </Button>
+                <Button variant="outline" onClick={handleExportRaw} disabled={exportingRaw}>
+                  {exportingRaw ? <><Loader2 className="h-4 w-4 animate-spin mr-2" />Preparing…</> : <><Download className="h-4 w-4 mr-2" />Export raw transcripts</>}
+                </Button>
+              </div>
             </div>
           )}
 
@@ -569,9 +637,7 @@ export function JobDetailClient({
             )}
 
             {hydrated && videos.length === 0 && (
-              <div className="py-12 text-center text-sm text-muted-foreground">
-                No videos found yet.
-              </div>
+              <div className="py-12 text-center text-sm text-muted-foreground">No videos found yet.</div>
             )}
 
             <div className="divide-y divide-border">
@@ -579,16 +645,9 @@ export function JobDetailClient({
                 const tStatus = video.transcript_status as string;
                 const rStatus = video.rewrite_status   as string;
                 const hasTx   = tStatus === 'done';
-
                 return (
-                  <div
-                    key={video.id as string}
-                    className="flex items-center gap-4 px-5 py-3 group"
-                  >
-                    <span className="text-muted-foreground text-sm w-6 text-right shrink-0">
-                      {index + 1}
-                    </span>
-
+                  <div key={video.id as string} className="flex items-center gap-4 px-5 py-3 group">
+                    <span className="text-muted-foreground text-sm w-6 text-right shrink-0">{index + 1}</span>
                     <div className="flex-1 min-w-0">
                       <p className="text-sm text-foreground truncate">
                         {(video.video_title as string) || (video.video_id as string)}
@@ -599,34 +658,22 @@ export function JobDetailClient({
                         </p>
                       )}
                     </div>
-
                     <div className="flex items-center gap-2 shrink-0">
-                      <Badge
-                        variant={TRANSCRIPT_VARIANTS[tStatus] ?? 'secondary'}
-                        className="text-xs"
-                      >
+                      <Badge variant={TRANSCRIPT_VARIANTS[tStatus] ?? 'secondary'} className="text-xs">
                         {tStatus === 'done'       ? '✓ Transcript'
                           : tStatus === 'failed'  ? '✗ No transcript'
                           : tStatus === 'skipped' ? '— Skipped'
                           : tStatus === 'processing' ? 'Extracting…'
                           : 'Pending'}
                       </Badge>
-
                       {rStatus && rStatus !== 'not_started' && (
-                        <Badge
-                          variant={REWRITE_VARIANTS[rStatus] ?? 'secondary'}
-                          className="text-xs"
-                        >
+                        <Badge variant={REWRITE_VARIANTS[rStatus] ?? 'secondary'} className="text-xs">
                           {rStatus === 'done' ? '✓ Rewritten' : rStatus}
                         </Badge>
                       )}
-
                       {hasTx && (
-                        <button
-                          onClick={() => setViewingVideo(video)}
-                          title="View transcript"
-                          className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors opacity-0 group-hover:opacity-100 focus:opacity-100"
-                        >
+                        <button onClick={() => setViewingVideo(video)} title="View transcript"
+                          className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors opacity-0 group-hover:opacity-100 focus:opacity-100">
                           <FileText className="h-4 w-4" />
                         </button>
                       )}

@@ -2,11 +2,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import type { ApiResponse } from '@/types';
 
-// OpenRouter free tier supports concurrent requests — 5 parallel is safe.
-// Each request is fire-and-forget; the pump returns immediately and the
-// client poller re-triggers it every few seconds to pick up the next batch.
-const BATCH_SIZE = 5;
-const MAX_RETRIES = 3;
+// Free-tier OpenRouter models have low RPM limits.
+// 2 parallel requests avoids hitting the per-model ceiling;
+// the 3-model fallback chain in ai/client.ts handles any remaining 429s.
+const BATCH_SIZE      = 2;
+const MAX_RETRIES     = 3;
 const PROCESSING_STALE_MS = 90_000;
 
 export async function POST(req: NextRequest) {
@@ -15,7 +15,6 @@ export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
     const { job_id } = body;
-
     if (!job_id) {
       return NextResponse.json<ApiResponse>({ success: false, error: 'job_id is required' }, { status: 400 });
     }
@@ -30,13 +29,11 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // --- Unstick stale processing rows ---
+    // Unstick stale processing rows
     const staleThreshold = new Date(Date.now() - PROCESSING_STALE_MS).toISOString();
-    await admin
-      .from('job_videos')
+    await admin.from('job_videos')
       .update({ rewrite_status: 'queued', rewrite_not_before: null })
-      .eq('job_id', job_id)
-      .eq('rewrite_status', 'processing')
+      .eq('job_id', job_id).eq('rewrite_status', 'processing')
       .lt('rewrite_attempted_at', staleThreshold);
 
     const now = new Date().toISOString();
@@ -56,7 +53,7 @@ export async function POST(req: NextRequest) {
       .eq('job_id', job_id).eq('rewrite_status', 'queued')
       .not('rewrite_not_before', 'is', null).gt('rewrite_not_before', now);
 
-    // --- All done? Advance job ---
+    // All done? Advance job to export
     if ((currentQueued ?? 0) === 0 && (currentProcessing ?? 0) === 0) {
       if ((inBackoff ?? 0) > 0) {
         return NextResponse.json<ApiResponse>({
@@ -68,7 +65,6 @@ export async function POST(req: NextRequest) {
       const { count: successCount } = await admin
         .from('job_videos').select('*', { count: 'exact', head: true })
         .eq('job_id', job_id).eq('rewrite_status', 'done');
-
       const { count: failedCount } = await admin
         .from('job_videos').select('*', { count: 'exact', head: true })
         .eq('job_id', job_id).eq('rewrite_status', 'failed');
@@ -88,7 +84,7 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // --- Throttle: already at batch capacity ---
+    // Already at batch capacity
     if ((currentProcessing ?? 0) >= BATCH_SIZE) {
       return NextResponse.json<ApiResponse>({
         success: true,
@@ -96,7 +92,7 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // --- Nothing ready (all in backoff) ---
+    // Nothing ready (all in backoff)
     if ((currentQueued ?? 0) === 0) {
       return NextResponse.json<ApiResponse>({
         success: true,
@@ -104,7 +100,7 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // --- Dispatch next batch (fill up to BATCH_SIZE slots) ---
+    // Dispatch next batch
     const slots = BATCH_SIZE - (currentProcessing ?? 0);
     const { data: batch } = await admin
       .from('job_videos').select('id, video_id')
@@ -129,8 +125,6 @@ export async function POST(req: NextRequest) {
     }).in('id', batch.map((v: { id: string }) => v.id));
 
     const baseUrl = process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000';
-
-    // Fire-and-forget — all BATCH_SIZE run in parallel
     batch.forEach((video: { id: string; video_id: string }) => {
       fetch(`${baseUrl}/api/worker/rewrite`, {
         method:  'POST',

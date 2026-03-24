@@ -9,8 +9,9 @@ import { Textarea } from '@/components/ui/textarea';
 import { toast } from 'sonner';
 import {
   Loader2, X, FileText, Trash2, Download,
-  Sparkles, ChevronRight, AlertTriangle,
+  Sparkles, ChevronRight, AlertTriangle, ChevronDown,
 } from 'lucide-react';
+import { FREE_MODELS, DEFAULT_MODEL } from '@/lib/ai/models';
 
 type Job = Record<string, unknown>;
 type JobVideo = Record<string, unknown>;
@@ -64,16 +65,9 @@ const CANCELLABLE_STATUSES = [
   'awaiting_prompt', 'queued_for_rewrite', 'rewriting', 'building_export',
 ];
 
-const ACTIVE_STATUSES = new Set([
-  'created', 'discovering', 'extracting',
-  'awaiting_prompt',
-  'queued_for_rewrite', 'rewriting', 'building_export',
-]);
-
-const TERMINAL_STATUSES = new Set(['completed', 'completed_with_errors', 'failed', 'cancelled']);
-
-// Statuses that should show a modal when TRANSITIONING INTO them
-const MODAL_TRIGGER_STATUSES = new Set(['awaiting_prompt', 'completed', 'completed_with_errors']);
+const ACTIVE_STATUSES   = new Set(['created','discovering','extracting','awaiting_prompt','queued_for_rewrite','rewriting','building_export']);
+const TERMINAL_STATUSES = new Set(['completed','completed_with_errors','failed','cancelled']);
+const MODAL_TRIGGER_STATUSES = new Set(['awaiting_prompt','completed','completed_with_errors']);
 
 type ModalState = 'none' | 'transcript_complete' | 'prompt' | 'export_ready';
 
@@ -158,7 +152,7 @@ function TranscriptCompleteModal({ transcriptCount, onRewrite, onExportRaw, onDi
                 <h2 className="text-lg font-bold text-foreground">Transcripts Ready!</h2>
               </div>
               <p className="text-sm text-muted-foreground">
-                <strong className="text-foreground">{transcriptCount}</strong> transcript{transcriptCount !== 1 ? 's' : ''} extracted. What would you like to do?
+                <strong className="text-foreground">{transcriptCount}</strong> transcript{transcriptCount !== 1 ? 's' : ''} extracted.
               </p>
             </div>
             <button onClick={onDismiss} className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors shrink-0">
@@ -172,7 +166,7 @@ function TranscriptCompleteModal({ transcriptCount, onRewrite, onExportRaw, onDi
             <div className="p-2.5 rounded-lg bg-primary/15 text-primary shrink-0"><Sparkles className="h-5 w-5" /></div>
             <div className="flex-1 min-w-0">
               <p className="font-semibold text-foreground group-hover:text-primary transition-colors">Rewrite with AI</p>
-              <p className="text-xs text-muted-foreground mt-0.5">Enter a prompt — AI rewrites all transcripts into polished content.</p>
+              <p className="text-xs text-muted-foreground mt-0.5">Enter a prompt — AI rewrites all transcripts.</p>
             </div>
             <ChevronRight className="h-4 w-4 text-muted-foreground group-hover:text-primary transition-colors shrink-0" />
           </button>
@@ -183,7 +177,7 @@ function TranscriptCompleteModal({ transcriptCount, onRewrite, onExportRaw, onDi
             </div>
             <div className="flex-1 min-w-0">
               <p className="font-semibold text-foreground">Export raw transcripts</p>
-              <p className="text-xs text-muted-foreground mt-0.5">Download all transcripts as a <code className="font-mono">.txt</code> file.</p>
+              <p className="text-xs text-muted-foreground mt-0.5">Download as <code className="font-mono">.txt</code>.</p>
             </div>
             <ChevronRight className="h-4 w-4 text-muted-foreground group-hover:text-foreground transition-colors shrink-0" />
           </button>
@@ -232,8 +226,8 @@ function ExportReadyModal({ rewriteCount, hasErrors, onDownload, onExportRaw, on
               {downloading ? <Loader2 className="h-5 w-5 animate-spin" /> : <Download className="h-5 w-5" />}
             </div>
             <div className="flex-1 min-w-0">
-              <p className="font-semibold text-foreground group-hover:text-primary transition-colors">Download Markdown Bundle</p>
-              <p className="text-xs text-muted-foreground mt-0.5">All rewritten scripts in one <code className="font-mono">.md</code> file.</p>
+              <p className="font-semibold text-foreground group-hover:text-primary transition-colors">Download Rewritten Bundle</p>
+              <p className="text-xs text-muted-foreground mt-0.5">All rewritten scripts in one <code className="font-mono">.txt</code> file.</p>
             </div>
             <ChevronRight className="h-4 w-4 text-muted-foreground group-hover:text-primary transition-colors shrink-0" />
           </button>
@@ -244,7 +238,7 @@ function ExportReadyModal({ rewriteCount, hasErrors, onDownload, onExportRaw, on
             </div>
             <div className="flex-1 min-w-0">
               <p className="font-semibold text-foreground">Export raw transcripts</p>
-              <p className="text-xs text-muted-foreground mt-0.5">Download original transcripts as <code className="font-mono">.txt</code>.</p>
+              <p className="text-xs text-muted-foreground mt-0.5">Download originals as <code className="font-mono">.txt</code>.</p>
             </div>
             <ChevronRight className="h-4 w-4 text-muted-foreground group-hover:text-foreground transition-colors shrink-0" />
           </button>
@@ -254,11 +248,16 @@ function ExportReadyModal({ rewriteCount, hasErrors, onDownload, onExportRaw, on
   );
 }
 
-// ─── Rewrite Prompt Modal ─────────────────────────────────────────────────────
+// ─── Rewrite Prompt Modal (with model picker) ─────────────────────────────────
 function RewritePromptModal({ transcriptCount, onSubmit, onBack, submitting }: {
-  transcriptCount: number; onSubmit: (prompt: string) => void; onBack: () => void; submitting: boolean;
+  transcriptCount: number;
+  onSubmit: (prompt: string, modelId: string) => void;
+  onBack:   () => void;
+  submitting: boolean;
 }) {
-  const [prompt, setPrompt] = useState('');
+  const [prompt,          setPrompt]          = useState('');
+  const [selectedModel,   setSelectedModel]   = useState(DEFAULT_MODEL);
+  const [showModelPicker, setShowModelPicker] = useState(false);
 
   useEffect(() => {
     const h = (e: KeyboardEvent) => { if (e.key === 'Escape' && !submitting) onBack(); };
@@ -266,31 +265,111 @@ function RewritePromptModal({ transcriptCount, onSubmit, onBack, submitting }: {
     return () => window.removeEventListener('keydown', h);
   }, [onBack, submitting]);
 
+  const activeModel = FREE_MODELS.find(m => m.id === selectedModel) ?? FREE_MODELS[0];
+  const fallbacks   = FREE_MODELS.filter(m => m.id !== selectedModel);
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
       <div className="bg-card border border-border rounded-xl shadow-2xl w-full max-w-lg mx-4">
+
+        {/* Header */}
         <div className="flex items-center justify-between gap-4 px-6 pt-6 pb-4">
           <div>
             <h2 className="text-lg font-bold text-foreground">AI Rewrite Prompt</h2>
-            <p className="text-sm text-muted-foreground mt-0.5">Applied to all <strong className="text-foreground">{transcriptCount}</strong> transcript{transcriptCount !== 1 ? 's' : ''}.</p>
+            <p className="text-sm text-muted-foreground mt-0.5">
+              Applied to all <strong className="text-foreground">{transcriptCount}</strong> transcript{transcriptCount !== 1 ? 's' : ''}.
+            </p>
           </div>
           <button onClick={onBack} disabled={submitting} className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors shrink-0 disabled:opacity-40">
             <X className="h-4 w-4" />
           </button>
         </div>
-        <div className="px-6 pb-6">
+
+        <div className="px-6 pb-6 space-y-4">
+          {/* Prompt textarea */}
           <Textarea
             autoFocus
             placeholder="e.g. Rewrite this YouTube transcript as a clean, engaging blog post. Remove filler words and timestamps."
             value={prompt}
             onChange={e => setPrompt(e.target.value)}
-            rows={6}
-            className="mb-4 resize-none"
+            rows={5}
+            className="resize-none"
             disabled={submitting}
           />
+
+          {/* Model picker */}
+          <div className="rounded-lg border border-border bg-secondary/20 p-3 space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">AI Model</span>
+              <button
+                type="button"
+                onClick={() => setShowModelPicker(v => !v)}
+                disabled={submitting}
+                className="flex items-center gap-1.5 text-xs text-primary hover:underline disabled:opacity-40"
+              >
+                Change <ChevronDown className={`h-3 w-3 transition-transform ${showModelPicker ? 'rotate-180' : ''}`} />
+              </button>
+            </div>
+
+            {/* Current selection summary */}
+            <div className="flex items-start gap-2">
+              <div className="h-2 w-2 rounded-full bg-green-400 mt-1.5 shrink-0" />
+              <div>
+                <p className="text-sm font-medium text-foreground">{activeModel.label}</p>
+                <p className="text-xs text-muted-foreground">{activeModel.description}</p>
+              </div>
+            </div>
+
+            {/* Fallback chain preview */}
+            {!showModelPicker && (
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="text-xs text-muted-foreground">Fallbacks:</span>
+                {fallbacks.map((m, i) => (
+                  <span key={m.id} className="text-xs bg-muted text-muted-foreground rounded px-1.5 py-0.5">
+                    {i + 1}. {m.label}
+                  </span>
+                ))}
+              </div>
+            )}
+
+            {/* Expanded model picker */}
+            {showModelPicker && (
+              <div className="space-y-1.5 pt-1">
+                {FREE_MODELS.map(m => (
+                  <button
+                    key={m.id}
+                    type="button"
+                    onClick={() => { setSelectedModel(m.id); setShowModelPicker(false); }}
+                    disabled={submitting}
+                    className={`w-full flex items-start gap-3 p-2.5 rounded-lg border text-left transition-all disabled:opacity-40
+                      ${ selectedModel === m.id
+                        ? 'border-primary/60 bg-primary/10 text-foreground'
+                        : 'border-border bg-background hover:border-primary/30 hover:bg-muted/50 text-muted-foreground hover:text-foreground'
+                      }`
+                    }
+                  >
+                    <div className={`h-2 w-2 rounded-full mt-1.5 shrink-0 ${ selectedModel === m.id ? 'bg-green-400' : 'bg-muted-foreground/40' }`} />
+                    <div>
+                      <p className="text-sm font-medium">
+                        {m.label}
+                        {m.default && <span className="ml-1.5 text-xs text-muted-foreground">(default)</span>}
+                      </p>
+                      <p className="text-xs opacity-70 mt-0.5">{m.description}</p>
+                      <p className="text-xs font-mono opacity-40 mt-0.5">{m.id}</p>
+                    </div>
+                  </button>
+                ))}
+                <p className="text-xs text-muted-foreground pt-1">
+                  On 429 rate-limit the other two models are tried automatically as fallbacks.
+                </p>
+              </div>
+            )}
+          </div>
+
+          {/* Actions */}
           <div className="flex items-center gap-3 justify-end">
             <Button variant="outline" onClick={onBack} disabled={submitting}>← Back</Button>
-            <Button onClick={() => onSubmit(prompt)} disabled={submitting || !prompt.trim()}>
+            <Button onClick={() => onSubmit(prompt, selectedModel)} disabled={submitting || !prompt.trim()}>
               {submitting
                 ? <><Loader2 className="h-4 w-4 animate-spin mr-2" />Submitting…</>
                 : <><Sparkles className="h-4 w-4 mr-2" />Rewrite {transcriptCount} transcript{transcriptCount !== 1 ? 's' : ''}</>
@@ -304,18 +383,6 @@ function RewritePromptModal({ transcriptCount, onSubmit, onBack, submitting }: {
 }
 
 // ─── Main Component ───────────────────────────────────────────────────────────
-//
-// Modal triggering architecture:
-// - Modals fire ONLY on a genuine status TRANSITION (oldStatus → newStatus).
-// - The first tick seeds statusRef but does NOT trigger a modal, even if the
-//   job is already at awaiting_prompt / completed on page load — the FAB
-//   handles that case instead.
-// - This is the only correct approach under React Strict Mode (which runs
-//   effects twice), because the ref guard would be consumed by the first
-//   mount and silently block the second mount.
-// - txModalShownRef / exportModalShownRef are RESET on every mount so that
-//   a fresh navigation to the page always starts clean.
-
 export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; initialVideos: JobVideo[] }) {
   const router = useRouter();
 
@@ -324,22 +391,14 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
   const [hydrated, setHydrated] = useState(initialVideos.length > 0);
   const [modal,    setModal]    = useState<ModalState>('none');
 
-  // ── Plain refs ────────────────────────────────────────────────────────────
-  // statusRef is seeded to a sentinel so the FIRST tick always looks like a
-  // real transition, letting us fire the pump but NOT the modal.
-  const statusRef            = useRef<string>('');
-  const modalRef             = useRef<ModalState>('none');
-  // These are intentionally reset to false every render of the component
-  // (i.e., fresh navigation). Do NOT persist across unmount/remount.
-  const txModalShownRef      = useRef<boolean>(false);
-  const exportModalShownRef  = useRef<boolean>(false);
-  const pumpRunningRef       = useRef<Record<string, boolean>>({});
-  const jobIdRef             = useRef<string>(initialJob.id as string);
+  const statusRef           = useRef<string>('');
+  const modalRef            = useRef<ModalState>('none');
+  const txModalShownRef     = useRef<boolean>(false);
+  const exportModalShownRef = useRef<boolean>(false);
+  const pumpRunningRef      = useRef<Record<string, boolean>>({});
+  const jobIdRef            = useRef<string>(initialJob.id as string);
 
-  const setModalSafe = (m: ModalState) => {
-    modalRef.current = m;
-    setModal(m);
-  };
+  const setModalSafe = (m: ModalState) => { modalRef.current = m; setModal(m); };
 
   const [isProcessing,     setIsProcessing]     = useState(ACTIVE_STATUSES.has(initialJob.status as string));
   const [submittingPrompt, setSubmittingPrompt] = useState(false);
@@ -351,13 +410,9 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
 
   const jobId = initialJob.id as string;
 
-  // ── triggerModal — fires ONLY on genuine transitions ─────────────────────
-  // oldStatus is '' (sentinel) on the first tick so we never fire a modal
-  // just because the page loaded onto an already-actionable status.
   function triggerModalForTransition(oldStatus: string, newStatus: string) {
-    if (oldStatus === newStatus) return;           // no change — do nothing
-    if (!MODAL_TRIGGER_STATUSES.has(newStatus)) return; // not a modal-worthy status
-
+    if (oldStatus === newStatus) return;
+    if (!MODAL_TRIGGER_STATUSES.has(newStatus)) return;
     if (newStatus === 'awaiting_prompt' && !txModalShownRef.current) {
       txModalShownRef.current = true;
       setModalSafe('transcript_complete');
@@ -368,7 +423,6 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
     }
   }
 
-  // ── kickPump ──────────────────────────────────────────────────────────────
   async function kickPump(endpoint: string) {
     if (pumpRunningRef.current[endpoint]) return;
     pumpRunningRef.current[endpoint] = true;
@@ -383,9 +437,8 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
         let data: { success: boolean; data?: { remaining?: number; advanced?: boolean; waiting?: boolean } } | null = null;
         try {
           const res = await fetch(endpoint, {
-            method:  'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body:    JSON.stringify({ job_id: jobIdNow }),
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ job_id: jobIdNow }),
           });
           if (res.ok) data = await res.json();
         } catch { /* network hiccup */ }
@@ -394,7 +447,6 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
         if ((data?.data?.remaining ?? 1) === 0) break;
         if (data?.data?.waiting)                { await sleep(3000); continue; }
         if (!data)                              { await sleep(5000); continue; }
-
         await sleep(1500);
       }
     } finally {
@@ -402,12 +454,9 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
     }
   }
 
-  // ── MAIN POLLING LOOP ─────────────────────────────────────────────────────
   useEffect(() => {
-    // Reset shown-flags on every mount so strict-mode double-mount starts clean
     txModalShownRef.current     = false;
     exportModalShownRef.current = false;
-    // Reset status sentinel so first tick is treated as a transition from nothing
     statusRef.current = '';
 
     const supabase = createClient();
@@ -416,61 +465,34 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
     const tick = async () => {
       if (destroyed) return;
       try {
-        const { data: jobData } = await supabase
-          .from('jobs')
-          .select('*')
-          .eq('id', jobId)
-          .single();
-
+        const { data: jobData } = await supabase.from('jobs').select('*').eq('id', jobId).single();
         if (!jobData || destroyed) return;
-
         const newStatus = jobData.status as string;
-        const oldStatus = statusRef.current;  // '' on very first tick
-
-        // Always update state
+        const oldStatus = statusRef.current;
         statusRef.current = newStatus;
         setJob(jobData as Job);
         setIsProcessing(ACTIVE_STATUSES.has(newStatus));
-
-        // Fire modal ONLY when status genuinely changed
         triggerModalForTransition(oldStatus, newStatus);
-
-        // Kick pump on status change
         if (newStatus !== oldStatus) {
           if (newStatus === 'extracting')                                      kickPump('/api/worker/pump/extract');
           if (newStatus === 'rewriting' || newStatus === 'queued_for_rewrite') kickPump('/api/worker/pump/rewrite');
         }
-
-        // Fetch videos
         const { data: videosData } = await supabase
-          .from('job_videos')
-          .select('*')
-          .eq('job_id', jobId)
-          .order('discovery_position', { ascending: true });
-
-        if (!destroyed && videosData) {
-          setVideos(videosData as JobVideo[]);
-          setHydrated(true);
-        }
+          .from('job_videos').select('*').eq('job_id', jobId).order('discovery_position', { ascending: true });
+        if (!destroyed && videosData) { setVideos(videosData as JobVideo[]); setHydrated(true); }
       } catch { /* ignore transient errors */ }
     };
 
-    // Boot pump for current status on mount (pump is idempotent)
     const s0 = initialJob.status as string;
-    if (s0 === 'extracting')                                 kickPump('/api/worker/pump/extract');
-    if (s0 === 'rewriting' || s0 === 'queued_for_rewrite')  kickPump('/api/worker/pump/rewrite');
+    if (s0 === 'extracting')                                kickPump('/api/worker/pump/extract');
+    if (s0 === 'rewriting' || s0 === 'queued_for_rewrite') kickPump('/api/worker/pump/rewrite');
 
     tick();
     const interval = setInterval(tick, 2000);
-
-    return () => {
-      destroyed = true;
-      clearInterval(interval);
-    };
+    return () => { destroyed = true; clearInterval(interval); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobId]);
 
-  // ── Realtime for live video row updates (cosmetic only) ───────────────────
   useEffect(() => {
     const supabase = createClient();
     const ch = supabase.channel(`job-videos-${jobId}`)
@@ -490,18 +512,17 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
   }, [jobId]);
 
   // ── Action handlers ───────────────────────────────────────────────────────
-
-  const handleSubmitPrompt = async (promptText: string) => {
+  const handleSubmitPrompt = async (promptText: string, modelId: string) => {
     setSubmittingPrompt(true);
     try {
       const res  = await fetch(`/api/jobs/${jobId}/prompt`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ master_prompt: promptText }),
+        body: JSON.stringify({ master_prompt: promptText, ai_model: modelId }),
       });
       const data = await res.json();
       if (!data.success) throw new Error((data.error as string) ?? 'Unknown error');
-      toast.success(`Queued ${data.data.queued_count as number} video${(data.data.queued_count as number) !== 1 ? 's' : ''} for rewriting`);
+      toast.success(`Queued ${data.data.queued_count as number} video${(data.data.queued_count as number) !== 1 ? 's' : ''} for rewriting with ${data.data.ai_model as string}`);
       setModalSafe('none');
       statusRef.current = 'queued_for_rewrite';
       setIsProcessing(true);
@@ -583,7 +604,7 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
     }
   };
 
-  // ── Derived values ────────────────────────────────────────────────────────
+  // ── Derived ───────────────────────────────────────────────────────────────
   const status         = job.status as string;
   const transcriptDone = videos.filter(v => v.transcript_status === 'done').length;
   const rewriteDone    = videos.filter(v => v.rewrite_status    === 'done').length;
@@ -592,7 +613,7 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
   const isActive       = ACTIVE_STATUSES.has(status);
 
   const showFAB =
-    (status === 'awaiting_prompt'    && modal === 'none') ||
+    (status === 'awaiting_prompt' && modal === 'none') ||
     ((status === 'completed' || status === 'completed_with_errors') && modal === 'none');
 
   const handleFABClick = () => {
@@ -641,14 +662,10 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
         />
       )}
 
-      {/* FAB — shows when a modal is dismissible and user needs next step */}
       {showFAB && (
         <div className="fixed bottom-6 right-6 z-40">
-          <button
-            onClick={handleFABClick}
-            title="Open next step"
-            className="flex items-center gap-2.5 h-12 px-5 rounded-full shadow-xl border border-primary/40 bg-primary text-primary-foreground font-semibold text-sm hover:bg-primary/90 active:scale-95 transition-all"
-          >
+          <button onClick={handleFABClick} title="Open next step"
+            className="flex items-center gap-2.5 h-12 px-5 rounded-full shadow-xl border border-primary/40 bg-primary text-primary-foreground font-semibold text-sm hover:bg-primary/90 active:scale-95 transition-all">
             <span>Progress</span>
             <ChevronRight className="h-4 w-4" />
           </button>
@@ -662,8 +679,7 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
           <div className="flex items-start justify-between mb-8 gap-4">
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-2 text-muted-foreground text-xs mb-2">
-                <span>📋</span>
-                <span className="capitalize font-medium">{job.source_type as string}</span>
+                <span>📋</span><span className="capitalize font-medium">{job.source_type as string}</span>
               </div>
               <h1 className="text-2xl font-bold text-foreground truncate">{(job.source_name as string) || 'Loading…'}</h1>
               <p className="text-muted-foreground text-sm mt-1 truncate">{job.source_url as string}</p>

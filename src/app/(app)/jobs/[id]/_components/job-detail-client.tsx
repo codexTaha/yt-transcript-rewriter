@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import { createClient } from '@/lib/supabase/client';
 import { Badge } from '@/components/ui/badge';
@@ -8,7 +8,7 @@ import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { toast } from 'sonner';
 import {
-  Loader2, X, FileText, Trash2, Download, Pencil,
+  Loader2, X, FileText, Trash2, Download,
   Sparkles, ChevronRight, AlertTriangle,
 } from 'lucide-react';
 
@@ -72,20 +72,21 @@ const ACTIVE_STATUSES = new Set([
 
 const TERMINAL_STATUSES = new Set(['completed', 'completed_with_errors', 'failed', 'cancelled']);
 
+type ModalState = 'none' | 'transcript_complete' | 'prompt' | 'export_ready';
+
 function sleep(ms: number) { return new Promise<void>(r => setTimeout(r, ms)); }
 
 // ─── Transcript Viewer Modal ──────────────────────────────────────────────────
-
 function TranscriptModal({ jobId, video, onClose }: { jobId: string; video: JobVideo; onClose: () => void }) {
-  const [text,    setText]    = useState<string | null>(null);
+  const [text, setText]       = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [error,   setError]   = useState<string | null>(null);
+  const [error, setError]     = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     fetch(`/api/jobs/${jobId}/transcript?video_id=${video.video_id as string}`)
       .then(r => r.json())
-      .then(d => { if (!cancelled) { if (d.success) setText(d.data.text as string); else setError((d.error as string) ?? 'Failed to load transcript'); } })
+      .then(d => { if (!cancelled) { if (d.success) setText(d.data.text as string); else setError((d.error as string) ?? 'Failed'); } })
       .catch(() => { if (!cancelled) setError('Network error'); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
@@ -98,10 +99,11 @@ function TranscriptModal({ jobId, video, onClose }: { jobId: string; video: JobV
   }, [onClose]);
 
   const wordCount = typeof video.transcript_word_count === 'number' ? video.transcript_word_count as number : null;
-  const language  = typeof video.transcript_language  === 'string' ? (video.transcript_language as string).toUpperCase() : null;
+  const language  = typeof video.transcript_language  === 'string' ? (video.transcript_language  as string).toUpperCase() : null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+         onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
       <div className="relative bg-card border border-border rounded-xl shadow-2xl w-full max-w-3xl mx-4 flex flex-col max-h-[85vh]">
         <div className="flex items-start justify-between gap-4 px-6 py-4 border-b border-border shrink-0">
           <div className="min-w-0">
@@ -112,8 +114,12 @@ function TranscriptModal({ jobId, video, onClose }: { jobId: string; video: JobV
             </div>
           </div>
           <div className="flex items-center gap-2 shrink-0">
-            <Button size="sm" variant="outline" onClick={() => { if (text) { navigator.clipboard.writeText(text); toast.success('Copied to clipboard'); } }} disabled={!text}>Copy</Button>
-            <button onClick={onClose} className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"><X className="h-4 w-4" /></button>
+            <Button size="sm" variant="outline"
+              onClick={() => { if (text) { navigator.clipboard.writeText(text); toast.success('Copied!'); } }}
+              disabled={!text}>Copy</Button>
+            <button onClick={onClose} className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors">
+              <X className="h-4 w-4" />
+            </button>
           </div>
         </div>
         <div className="overflow-y-auto flex-1 px-6 py-4">
@@ -126,10 +132,10 @@ function TranscriptModal({ jobId, video, onClose }: { jobId: string; video: JobV
   );
 }
 
-// ─── Transcript Completion Modal (after extraction) ───────────────────────────
-
+// ─── Transcript Complete Modal ────────────────────────────────────────────────
 function TranscriptCompleteModal({ transcriptCount, onRewrite, onExportRaw, onDismiss, exportingRaw }: {
-  transcriptCount: number; onRewrite: () => void; onExportRaw: () => void; onDismiss: () => void; exportingRaw: boolean;
+  transcriptCount: number; onRewrite: () => void; onExportRaw: () => void;
+  onDismiss: () => void; exportingRaw: boolean;
 }) {
   useEffect(() => {
     const h = (e: KeyboardEvent) => { if (e.key === 'Escape') onDismiss(); };
@@ -138,16 +144,14 @@ function TranscriptCompleteModal({ transcriptCount, onRewrite, onExportRaw, onDi
   }, [onDismiss]);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={e => { if (e.target === e.currentTarget) onDismiss(); }}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+         onClick={e => { if (e.target === e.currentTarget) onDismiss(); }}>
       <div className="bg-card border border-border rounded-xl shadow-2xl w-full max-w-md mx-4 overflow-hidden">
-        {/* Header */}
         <div className="bg-gradient-to-br from-primary/10 to-transparent px-6 pt-6 pb-4">
           <div className="flex items-start justify-between gap-4">
             <div>
               <div className="flex items-center gap-2 mb-1">
-                <div className="h-7 w-7 rounded-full bg-green-500/20 flex items-center justify-center">
-                  <span className="text-sm">✅</span>
-                </div>
+                <div className="h-7 w-7 rounded-full bg-green-500/20 flex items-center justify-center"><span className="text-sm">✅</span></div>
                 <h2 className="text-lg font-bold text-foreground">Transcripts Ready!</h2>
               </div>
               <p className="text-sm text-muted-foreground">
@@ -159,19 +163,18 @@ function TranscriptCompleteModal({ transcriptCount, onRewrite, onExportRaw, onDi
             </button>
           </div>
         </div>
-        {/* Options */}
         <div className="px-6 pb-6 pt-2 flex flex-col gap-3">
-          <button onClick={onRewrite} className="w-full flex items-center gap-4 p-4 rounded-xl border-2 border-primary/30 bg-primary/5 hover:border-primary hover:bg-primary/10 transition-all text-left group">
-            <div className="p-2.5 rounded-lg bg-primary/15 text-primary shrink-0">
-              <Sparkles className="h-5 w-5" />
-            </div>
+          <button onClick={onRewrite}
+            className="w-full flex items-center gap-4 p-4 rounded-xl border-2 border-primary/30 bg-primary/5 hover:border-primary hover:bg-primary/10 transition-all text-left group">
+            <div className="p-2.5 rounded-lg bg-primary/15 text-primary shrink-0"><Sparkles className="h-5 w-5" /></div>
             <div className="flex-1 min-w-0">
               <p className="font-semibold text-foreground group-hover:text-primary transition-colors">Rewrite with AI</p>
               <p className="text-xs text-muted-foreground mt-0.5">Enter a prompt — AI rewrites all transcripts into polished content.</p>
             </div>
             <ChevronRight className="h-4 w-4 text-muted-foreground group-hover:text-primary transition-colors shrink-0" />
           </button>
-          <button onClick={onExportRaw} disabled={exportingRaw} className="w-full flex items-center gap-4 p-4 rounded-xl border border-border bg-background hover:border-primary/40 hover:bg-muted/50 transition-all text-left group disabled:opacity-60 disabled:cursor-not-allowed">
+          <button onClick={onExportRaw} disabled={exportingRaw}
+            className="w-full flex items-center gap-4 p-4 rounded-xl border border-border bg-background hover:border-primary/40 hover:bg-muted/50 transition-all text-left group disabled:opacity-60 disabled:cursor-not-allowed">
             <div className="p-2.5 rounded-lg bg-muted text-muted-foreground shrink-0">
               {exportingRaw ? <Loader2 className="h-5 w-5 animate-spin" /> : <Download className="h-5 w-5" />}
             </div>
@@ -187,8 +190,7 @@ function TranscriptCompleteModal({ transcriptCount, onRewrite, onExportRaw, onDi
   );
 }
 
-// ─── Export Ready Modal (after rewrites complete) ─────────────────────────────
-
+// ─── Export Ready Modal ───────────────────────────────────────────────────────
 function ExportReadyModal({ rewriteCount, hasErrors, onDownload, onExportRaw, onDismiss, downloading, exportingRaw }: {
   rewriteCount: number; hasErrors: boolean; onDownload: () => void; onExportRaw: () => void;
   onDismiss: () => void; downloading: boolean; exportingRaw: boolean;
@@ -200,15 +202,14 @@ function ExportReadyModal({ rewriteCount, hasErrors, onDownload, onExportRaw, on
   }, [onDismiss]);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={e => { if (e.target === e.currentTarget) onDismiss(); }}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+         onClick={e => { if (e.target === e.currentTarget) onDismiss(); }}>
       <div className="bg-card border border-border rounded-xl shadow-2xl w-full max-w-md mx-4 overflow-hidden">
         <div className="bg-gradient-to-br from-green-500/10 to-transparent px-6 pt-6 pb-4">
           <div className="flex items-start justify-between gap-4">
             <div>
               <div className="flex items-center gap-2 mb-1">
-                <div className="h-7 w-7 rounded-full bg-green-500/20 flex items-center justify-center">
-                  <span className="text-sm">🎉</span>
-                </div>
+                <div className="h-7 w-7 rounded-full bg-green-500/20 flex items-center justify-center"><span className="text-sm">🎉</span></div>
                 <h2 className="text-lg font-bold text-foreground">Rewrites Complete!</h2>
               </div>
               <p className="text-sm text-muted-foreground">
@@ -222,7 +223,8 @@ function ExportReadyModal({ rewriteCount, hasErrors, onDownload, onExportRaw, on
           </div>
         </div>
         <div className="px-6 pb-6 pt-2 flex flex-col gap-3">
-          <button onClick={onDownload} disabled={downloading} className="w-full flex items-center gap-4 p-4 rounded-xl border-2 border-primary/30 bg-primary/5 hover:border-primary hover:bg-primary/10 transition-all text-left group disabled:opacity-60 disabled:cursor-not-allowed">
+          <button onClick={onDownload} disabled={downloading}
+            className="w-full flex items-center gap-4 p-4 rounded-xl border-2 border-primary/30 bg-primary/5 hover:border-primary hover:bg-primary/10 transition-all text-left group disabled:opacity-60 disabled:cursor-not-allowed">
             <div className="p-2.5 rounded-lg bg-primary/15 text-primary shrink-0">
               {downloading ? <Loader2 className="h-5 w-5 animate-spin" /> : <Download className="h-5 w-5" />}
             </div>
@@ -232,7 +234,8 @@ function ExportReadyModal({ rewriteCount, hasErrors, onDownload, onExportRaw, on
             </div>
             <ChevronRight className="h-4 w-4 text-muted-foreground group-hover:text-primary transition-colors shrink-0" />
           </button>
-          <button onClick={onExportRaw} disabled={exportingRaw} className="w-full flex items-center gap-4 p-4 rounded-xl border border-border bg-background hover:border-primary/40 hover:bg-muted/50 transition-all text-left group disabled:opacity-60 disabled:cursor-not-allowed">
+          <button onClick={onExportRaw} disabled={exportingRaw}
+            className="w-full flex items-center gap-4 p-4 rounded-xl border border-border bg-background hover:border-primary/40 hover:bg-muted/50 transition-all text-left group disabled:opacity-60 disabled:cursor-not-allowed">
             <div className="p-2.5 rounded-lg bg-muted text-muted-foreground shrink-0">
               {exportingRaw ? <Loader2 className="h-5 w-5 animate-spin" /> : <FileText className="h-5 w-5" />}
             </div>
@@ -249,7 +252,6 @@ function ExportReadyModal({ rewriteCount, hasErrors, onDownload, onExportRaw, on
 }
 
 // ─── Rewrite Prompt Modal ─────────────────────────────────────────────────────
-
 function RewritePromptModal({ transcriptCount, onSubmit, onBack, submitting }: {
   transcriptCount: number; onSubmit: (prompt: string) => void; onBack: () => void; submitting: boolean;
 }) {
@@ -276,7 +278,7 @@ function RewritePromptModal({ transcriptCount, onSubmit, onBack, submitting }: {
         <div className="px-6 pb-6">
           <Textarea
             autoFocus
-            placeholder="e.g. Rewrite this YouTube transcript as a clean, engaging blog post. Remove filler words and timestamps. Use markdown headings where appropriate."
+            placeholder="e.g. Rewrite this YouTube transcript as a clean, engaging blog post. Remove filler words and timestamps."
             value={prompt}
             onChange={e => setPrompt(e.target.value)}
             rows={6}
@@ -299,8 +301,16 @@ function RewritePromptModal({ transcriptCount, onSubmit, onBack, submitting }: {
 }
 
 // ─── Main Component ───────────────────────────────────────────────────────────
-
-type ModalState = 'none' | 'transcript_complete' | 'prompt' | 'export_ready';
+//
+// Architecture decision: we use a SINGLE tight polling loop (every 2s while
+// active) as the ONLY source of truth for status transitions. We deliberately
+// do NOT rely on React closure-captured callbacks in pump loops or Realtime
+// events to trigger modals, because those suffer from stale-closure bugs and
+// hot-reload ref-carryover. The poll is a simple setInterval that reads the DB
+// and updates state — dead simple, impossible to miss a transition.
+//
+// The pump functions continue to exist to DRIVE server work (kick off workers),
+// but modal triggering is 100% owned by the polling loop.
 
 export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; initialVideos: JobVideo[] }) {
   const router = useRouter();
@@ -310,18 +320,21 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
   const [hydrated, setHydrated] = useState(initialVideos.length > 0);
   const [modal,    setModal]    = useState<ModalState>('none');
 
-  // Refs — never drive render, used inside callbacks/intervals/pumps
-  const jobRef              = useRef<Job>(initialJob);
-  const videosRef           = useRef<JobVideo[]>(initialVideos);
-  const statusRef           = useRef<string>(initialJob.status as string);
-  const pumpRunning         = useRef<Record<string, boolean>>({});
-  const transcriptModalShown = useRef<boolean>(false);
-  const exportModalShown    = useRef<boolean>(false);
-  // Track if something is still in-flight so the FAB can be grayed out
-  const [isProcessing, setIsProcessing] = useState(
-    ACTIVE_STATUSES.has(initialJob.status as string)
-  );
+  // ── Plain refs (never stale — only read as current values) ────────────────
+  const statusRef            = useRef<string>(initialJob.status as string);
+  const modalRef             = useRef<ModalState>('none');
+  const txModalShownRef      = useRef<boolean>(false);
+  const exportModalShownRef  = useRef<boolean>(false);
+  const pumpRunningRef       = useRef<Record<string, boolean>>({});
+  const jobIdRef             = useRef<string>(initialJob.id as string);
 
+  // Keep modalRef in sync with modal state
+  const setModalSafe = (m: ModalState) => {
+    modalRef.current = m;
+    setModal(m);
+  };
+
+  const [isProcessing,    setIsProcessing]    = useState(ACTIVE_STATUSES.has(initialJob.status as string));
   const [submittingPrompt, setSubmittingPrompt] = useState(false);
   const [downloading,      setDownloading]      = useState(false);
   const [exportingRaw,     setExportingRaw]     = useState(false);
@@ -331,238 +344,169 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
 
   const jobId = initialJob.id as string;
 
-  // ── applyJobUpdate — single place that mutates job state ─────────────────
-  const applyJobUpdate = useCallback((incoming: Job): boolean => {
-    const oldStatus = jobRef.current.status as string;
-    const newStatus = incoming.status       as string;
-    jobRef.current  = incoming;
-    setJob(incoming);
-    if (newStatus !== oldStatus) {
-      statusRef.current = newStatus;
-      setIsProcessing(ACTIVE_STATUSES.has(newStatus));
-      return true;
+  // ── triggerModal — the ONLY function that opens stage-transition modals ──
+  // Called exclusively from the polling loop. Checks ref guards so it fires
+  // exactly once per stage, even if called multiple times.
+  function triggerModalForStatus(s: string) {
+    if (s === 'awaiting_prompt' && !txModalShownRef.current) {
+      txModalShownRef.current = true;
+      setModalSafe('transcript_complete');
     }
-    return false;
-  }, []);
-
-  // ── applyVideoUpdate ──────────────────────────────────────────────────────
-  const applyVideoUpdate = useCallback((incoming: JobVideo) => {
-    setVideos(prev => {
-      const next = prev.some(v => (v.id as string) === (incoming.id as string))
-        ? prev.map(v => (v.id as string) === (incoming.id as string) ? incoming : v)
-        : [...prev, incoming];
-      videosRef.current = next;
-      return next;
-    });
-    setHydrated(true);
-  }, []);
-
-  // ── maybeShowModal — central modal trigger, called from EVERY status path ─
-  // This is the definitive fix for the pipeline transition bug:
-  // Both stage transitions (extracting→awaiting_prompt AND completed) trigger here.
-  const maybeShowModal = useCallback((s: string) => {
-    if (s === 'awaiting_prompt' && !transcriptModalShown.current) {
-      transcriptModalShown.current = true;
-      // Small delay so UI settles before popup appears
-      setTimeout(() => setModal('transcript_complete'), 800);
+    if ((s === 'completed' || s === 'completed_with_errors') && !exportModalShownRef.current) {
+      exportModalShownRef.current = true;
+      setModalSafe('export_ready');
     }
-    if ((s === 'completed' || s === 'completed_with_errors') && !exportModalShown.current) {
-      exportModalShown.current = true;
-      setTimeout(() => setModal('export_ready'), 800);
-    }
-  }, []);
+  }
 
-  // ── syncStatusFromDB — authoritative DB read ──────────────────────────────
-  const syncStatusFromDB = useCallback(async (): Promise<string> => {
-    try {
-      const supabase = createClient();
-      const { data } = await supabase.from('jobs').select('*').eq('id', jobId).single();
-      if (data) {
-        const changed = applyJobUpdate(data as Job);
-        if (changed) maybeShowModal(data.status as string);
-        return data.status as string;
-      }
-    } catch { /* ignore transient */ }
-    return statusRef.current;
-  }, [jobId, applyJobUpdate, maybeShowModal]);
-
-  // ── pump — drives server-side workers ────────────────────────────────────
-  // FIX: when pump sees `waiting` (workers still processing) it now schedules
-  // a DB sync after a delay EVEN IF it breaks out, so the transition is never
-  // missed if Realtime is flaky or the pump exits the loop early.
-  const pump = useCallback(async (endpoint: string) => {
-    if (pumpRunning.current[endpoint]) return;
-    pumpRunning.current[endpoint] = true;
+  // ── kickPump — fire-and-forget pump driver ────────────────────────────────
+  // Only DRIVES server workers. Does NOT trigger modals. Polling handles that.
+  async function kickPump(endpoint: string) {
+    if (pumpRunningRef.current[endpoint]) return;
+    pumpRunningRef.current[endpoint] = true;
+    const jobIdNow = jobIdRef.current;
     try {
       while (true) {
         const s = statusRef.current;
         if (TERMINAL_STATUSES.has(s)) break;
-        if (endpoint.includes('extract') && s !== 'extracting') break;
-        if (endpoint.includes('rewrite') && !['rewriting', 'queued_for_rewrite'].includes(s)) break;
+        if (endpoint.includes('extract') && s !== 'extracting')                               break;
+        if (endpoint.includes('rewrite') && !['rewriting','queued_for_rewrite'].includes(s)) break;
 
-        let resp: { success: boolean; data?: { remaining?: number; advanced?: boolean; next_status?: string; waiting?: boolean } } | null = null;
+        let data: { success: boolean; data?: { remaining?: number; advanced?: boolean; waiting?: boolean } } | null = null;
         try {
           const res = await fetch(endpoint, {
-            method: 'POST',
+            method:  'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ job_id: jobId }),
+            body:    JSON.stringify({ job_id: jobIdNow }),
           });
-          if (!res.ok) { await sleep(5000); continue; }
-          resp = await res.json();
-        } catch {
-          await syncStatusFromDB();
-          await sleep(3000);
-          continue;
-        }
+          if (res.ok) data = await res.json();
+        } catch { /* network hiccup — keep looping, polling will catch status */ }
 
-        // 1. Server says job advanced to next status
-        if (resp?.data?.advanced) {
-          const next = resp.data.next_status;
-          if (next) {
-            statusRef.current = next;
-            setIsProcessing(ACTIVE_STATUSES.has(next));
-            setJob(prev => { const u = { ...prev, status: next }; jobRef.current = u; return u; });
-            maybeShowModal(next);
-          } else {
-            await syncStatusFromDB();
-          }
-          break;
-        }
+        if (data?.data?.advanced)                       break; // polling will see new status
+        if ((data?.data?.remaining ?? 1) === 0)         break; // done, polling will see it
+        if (data?.data?.waiting)                        { await sleep(3000); continue; }
+        if (!data)                                      { await sleep(5000); continue; }
 
-        // 2. Workers still processing — wait, then ALWAYS sync DB so we catch
-        //    the transition even if the pump exits before seeing advanced:true
-        if (resp?.data?.waiting) {
-          await sleep(3000);
-          // After waiting, sync DB directly — don't rely on the next pump call
-          await syncStatusFromDB();
-          // If we've now left the valid status range, break
-          const sNow = statusRef.current;
-          if (TERMINAL_STATUSES.has(sNow)) break;
-          if (endpoint.includes('extract') && sNow !== 'extracting') break;
-          if (endpoint.includes('rewrite') && !['rewriting', 'queued_for_rewrite'].includes(sNow)) break;
-          continue;
-        }
-
-        // 3. Nothing remaining — sync DB before breaking (guards against race)
-        if ((resp?.data?.remaining ?? 1) <= 0) {
-          await syncStatusFromDB();
-          break;
-        }
-
-        await sleep(2000);
+        await sleep(1500);
       }
     } finally {
-      pumpRunning.current[endpoint] = false;
-      // CRITICAL: after any pump exits, do one final DB sync.
-      // This is the safety net that guarantees the modal fires even if every
-      // other path above failed to detect the status transition.
-      await syncStatusFromDB();
+      pumpRunningRef.current[endpoint] = false;
     }
-  }, [jobId, maybeShowModal, syncStatusFromDB]);
+  }
 
-  // ── startPumpIfNeeded ─────────────────────────────────────────────────────
-  const startPumpIfNeeded = useCallback((s: string) => {
-    if (s === 'extracting')                                   pump('/api/worker/pump/extract');
-    else if (s === 'rewriting' || s === 'queued_for_rewrite') pump('/api/worker/pump/rewrite');
-  }, [pump]);
-
-  // ── Mount: fresh DB fetch + boot pumps ───────────────────────────────────
+  // ── MAIN POLLING LOOP ─────────────────────────────────────────────────────
+  // This is the definitive fix. A simple setInterval that:
+  //  1. Reads the authoritative job status from DB every 2s
+  //  2. Updates React state
+  //  3. Triggers modals on transition
+  //  4. Kicks pumps when status demands it
+  //  5. Stops when terminal AND all expected modals shown
   useEffect(() => {
-    let active = true;
     const supabase = createClient();
-    supabase.from('jobs').select('*').eq('id', jobId).single().then(({ data }) => {
-      if (!active || !data) return;
-      applyJobUpdate(data as Job);
-      maybeShowModal(data.status as string);
-      startPumpIfNeeded(data.status as string);
-    });
-    supabase.from('job_videos').select('*').eq('job_id', jobId).order('discovery_position', { ascending: true }).then(({ data }) => {
-      if (!active || !data) return;
-      videosRef.current = data as JobVideo[];
-      setVideos(data as JobVideo[]);
-      setHydrated(true);
-    });
-    return () => { active = false; };
+    let destroyed  = false;
+
+    // Seed initial state
+    statusRef.current = initialJob.status as string;
+    triggerModalForStatus(initialJob.status as string);
+
+    const tick = async () => {
+      if (destroyed) return;
+      try {
+        // ── Fetch job
+        const { data: jobData } = await supabase
+          .from('jobs')
+          .select('*')
+          .eq('id', jobId)
+          .single();
+
+        if (!jobData || destroyed) return;
+
+        const newStatus = jobData.status as string;
+        const oldStatus = statusRef.current;
+
+        // Update state unconditionally so counts/fields stay fresh
+        statusRef.current = newStatus;
+        setJob(jobData as Job);
+        setIsProcessing(ACTIVE_STATUSES.has(newStatus));
+
+        // Trigger modal on status change
+        if (newStatus !== oldStatus) {
+          triggerModalForStatus(newStatus);
+          // Kick pump if new status needs one
+          if (newStatus === 'extracting')                                    kickPump('/api/worker/pump/extract');
+          if (newStatus === 'rewriting' || newStatus === 'queued_for_rewrite') kickPump('/api/worker/pump/rewrite');
+        }
+
+        // Also trigger modal on FIRST tick if we arrive on an actionable status
+        // (handles page load after job already finished)
+        triggerModalForStatus(newStatus);
+
+        // ── Fetch videos (keep list fresh)
+        const { data: videosData } = await supabase
+          .from('job_videos')
+          .select('*')
+          .eq('job_id', jobId)
+          .order('discovery_position', { ascending: true });
+
+        if (!destroyed && videosData) {
+          setVideos(videosData as JobVideo[]);
+          setHydrated(true);
+        }
+      } catch { /* ignore transient errors */ }
+    };
+
+    // First tick immediately, then every 2s
+    tick();
+    const interval = setInterval(tick, 2000);
+
+    // Boot pump for current status on mount
+    const s0 = initialJob.status as string;
+    if (s0 === 'extracting')                                    kickPump('/api/worker/pump/extract');
+    if (s0 === 'rewriting' || s0 === 'queued_for_rewrite')      kickPump('/api/worker/pump/rewrite');
+
+    return () => {
+      destroyed = true;
+      clearInterval(interval);
+    };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobId]);
 
-  // ── Realtime ──────────────────────────────────────────────────────────────
+  // ── Also subscribe Realtime for live video row updates (cosmetic only) ────
   useEffect(() => {
     const supabase = createClient();
-    const ch = supabase.channel(`job-detail-${jobId}`)
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'jobs', filter: `id=eq.${jobId}` }, payload => {
-        const updated = payload.new as Job;
-        const changed = applyJobUpdate(updated);
-        if (changed) { maybeShowModal(updated.status as string); startPumpIfNeeded(updated.status as string); }
+    const ch = supabase.channel(`job-videos-${jobId}`)
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'job_videos', filter: `job_id=eq.${jobId}` }, payload => {
+        setVideos(prev => {
+          if (prev.some(v => (v.id as string) === (payload.new.id as string))) return prev;
+          return [...prev, payload.new as JobVideo];
+        });
+        setHydrated(true);
       })
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'job_videos', filter: `job_id=eq.${jobId}` }, payload => applyVideoUpdate(payload.new as JobVideo))
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'job_videos', filter: `job_id=eq.${jobId}` }, payload => applyVideoUpdate(payload.new as JobVideo))
-      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'job_videos', filter: `job_id=eq.${jobId}` }, payload => {
-        setVideos(prev => { const next = prev.filter(v => (v.id as string) !== (payload.old.id as string)); videosRef.current = next; return next; });
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'job_videos', filter: `job_id=eq.${jobId}` }, payload => {
+        setVideos(prev => prev.map(v => (v.id as string) === (payload.new.id as string) ? payload.new as JobVideo : v));
       })
       .subscribe();
     return () => { supabase.removeChannel(ch); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobId]);
 
-  // ── Polling fallback — runs while job is active ───────────────────────────
-  // Polls every 4s regardless of pump/Realtime state. This is the ultimate
-  // safety net: if pump exits without triggering modal and Realtime is down,
-  // polling will pick up the status change and call maybeShowModal.
-  useEffect(() => {
-    let active = true;
-    const supabase = createClient();
-
-    const poll = async () => {
-      if (!active) return;
-      const s = statusRef.current;
-      // Keep polling through ACTIVE and also newly-terminal states until we
-      // know the modal has been shown
-      if (TERMINAL_STATUSES.has(s) && exportModalShown.current && transcriptModalShown.current) return;
-
-      try {
-        const { data } = await supabase.from('jobs').select('*').eq('id', jobId).single();
-        if (!active || !data) return;
-        const changed = applyJobUpdate(data as Job);
-        if (changed) {
-          maybeShowModal(data.status as string);
-          startPumpIfNeeded(data.status as string);
-        }
-      } catch { /* ignore */ }
-
-      if (!active) return;
-      // Stop only when truly terminal AND all relevant modals already shown
-      const sNow = statusRef.current;
-      const done = TERMINAL_STATUSES.has(sNow) && exportModalShown.current && transcriptModalShown.current;
-      if (!done) setTimeout(poll, 4000);
-    };
-
-    const tid = setTimeout(poll, 4000);
-    return () => { active = false; clearTimeout(tid); };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jobId]);
-
-  // ── Boot pumps on initial load ────────────────────────────────────────────
-  useEffect(() => {
-    startPumpIfNeeded(initialJob.status as string);
-    maybeShowModal(initialJob.status as string);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   // ── Action handlers ───────────────────────────────────────────────────────
 
   const handleSubmitPrompt = async (promptText: string) => {
     setSubmittingPrompt(true);
     try {
-      const res  = await fetch(`/api/jobs/${jobId}/prompt`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ master_prompt: promptText }) });
+      const res  = await fetch(`/api/jobs/${jobId}/prompt`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ master_prompt: promptText }),
+      });
       const data = await res.json();
       if (!data.success) throw new Error((data.error as string) ?? 'Unknown error');
       toast.success(`Queued ${data.data.queued_count as number} video${(data.data.queued_count as number) !== 1 ? 's' : ''} for rewriting`);
-      setModal('none');
+      setModalSafe('none');
       statusRef.current = 'queued_for_rewrite';
       setIsProcessing(true);
-      setJob(prev => { const u = { ...prev, status: 'queued_for_rewrite' }; jobRef.current = u; return u; });
-      pump('/api/worker/pump/rewrite');
+      setJob(prev => ({ ...prev, status: 'queued_for_rewrite' }));
+      kickPump('/api/worker/pump/rewrite');
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Failed to submit prompt');
     } finally {
@@ -572,7 +516,8 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
 
   const handleExportRaw = async () => {
     if (exportingRaw) return;
-    setExportingRaw(true); setModal('none');
+    setExportingRaw(true);
+    setModalSafe('none');
     try {
       const res = await fetch(`/api/jobs/${jobId}/export-transcripts`);
       if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error((e as { error?: string }).error ?? `HTTP ${res.status}`); }
@@ -580,10 +525,14 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
       const url  = URL.createObjectURL(blob);
       const a    = document.createElement('a');
       a.href = url; a.download = `transcripts-${jobId.slice(0, 8)}.txt`;
-      document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      URL.revokeObjectURL(url);
       toast.success('Transcripts downloaded');
-    } catch (err) { toast.error(err instanceof Error ? err.message : 'Export failed'); }
-    finally { setExportingRaw(false); }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Export failed');
+    } finally {
+      setExportingRaw(false);
+    }
   };
 
   const handleDownloadRewritten = async () => {
@@ -593,8 +542,11 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
       const data = await res.json();
       if (!data.success) throw new Error((data.error as string) ?? 'Unknown error');
       window.open(data.data.url as string, '_blank');
-    } catch (err) { toast.error(err instanceof Error ? err.message : 'Download failed'); }
-    finally { setDownloading(false); }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Download failed');
+    } finally {
+      setDownloading(false);
+    }
   };
 
   const handleCancel = async () => {
@@ -607,21 +559,28 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
       toast.success('Job cancelled');
       statusRef.current = 'cancelled';
       setIsProcessing(false);
-      setJob(prev => { const u = { ...prev, status: 'cancelled' }; jobRef.current = u; return u; });
-      setModal('none');
-    } catch (err) { toast.error(err instanceof Error ? err.message : 'Failed to cancel'); }
-    finally { setCancelling(false); }
+      setJob(prev => ({ ...prev, status: 'cancelled' }));
+      setModalSafe('none');
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to cancel');
+    } finally {
+      setCancelling(false);
+    }
   };
 
   const handleDelete = async () => {
-    if (!confirm('Permanently delete this job and ALL its data? This cannot be undone.')) return;
+    if (!confirm('Permanently delete this job and ALL its data?')) return;
     setDeleting(true);
     try {
       const res  = await fetch(`/api/jobs/${jobId}/delete`, { method: 'DELETE' });
       const data = await res.json();
       if (!data.success) throw new Error((data.error as string) ?? 'Unknown error');
-      toast.success('Job deleted'); router.push('/dashboard');
-    } catch (err) { toast.error(err instanceof Error ? err.message : 'Failed to delete'); setDeleting(false); }
+      toast.success('Job deleted');
+      router.push('/dashboard');
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to delete');
+      setDeleting(false);
+    }
   };
 
   // ── Derived values ────────────────────────────────────────────────────────
@@ -632,36 +591,31 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
   const isCancellable  = CANCELLABLE_STATUSES.includes(status);
   const isActive       = ACTIVE_STATUSES.has(status);
 
-  // ── FAB visibility — "Progress" button bottom-right ──────────────────────
-  // Shown when: transcript phase done (awaiting_prompt) OR rewrite phase done (completed*)
-  // Disabled when something is processing
   const showFAB =
-    (status === 'awaiting_prompt' && modal === 'none') ||
+    (status === 'awaiting_prompt'    && modal === 'none') ||
     ((status === 'completed' || status === 'completed_with_errors') && modal === 'none');
 
   const handleFABClick = () => {
-    if (isProcessing) return;
     if (status === 'awaiting_prompt') {
-      transcriptModalShown.current = false;
-      maybeShowModal('awaiting_prompt');
+      txModalShownRef.current = false;
+      triggerModalForStatus('awaiting_prompt');
     } else if (status === 'completed' || status === 'completed_with_errors') {
-      exportModalShown.current = false;
-      maybeShowModal(status);
+      exportModalShownRef.current = false;
+      triggerModalForStatus(status);
     }
   };
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
     <>
-      {/* Modals */}
       {viewingVideo && <TranscriptModal jobId={jobId} video={viewingVideo} onClose={() => setViewingVideo(null)} />}
 
       {modal === 'transcript_complete' && (
         <TranscriptCompleteModal
           transcriptCount={transcriptDone}
-          onRewrite={() => setModal('prompt')}
+          onRewrite={() => setModalSafe('prompt')}
           onExportRaw={handleExportRaw}
-          onDismiss={() => setModal('none')}
+          onDismiss={() => setModalSafe('none')}
           exportingRaw={exportingRaw}
         />
       )}
@@ -670,7 +624,7 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
         <RewritePromptModal
           transcriptCount={transcriptDone}
           onSubmit={handleSubmitPrompt}
-          onBack={() => setModal('transcript_complete')}
+          onBack={() => setModalSafe('transcript_complete')}
           submitting={submittingPrompt}
         />
       )}
@@ -681,7 +635,7 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
           hasErrors={status === 'completed_with_errors'}
           onDownload={handleDownloadRewritten}
           onExportRaw={handleExportRaw}
-          onDismiss={() => setModal('none')}
+          onDismiss={() => setModalSafe('none')}
           downloading={downloading}
           exportingRaw={exportingRaw}
         />
@@ -692,13 +646,11 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
         <div className="fixed bottom-6 right-6 z-40">
           <button
             onClick={handleFABClick}
-            disabled={isProcessing}
-            title={isProcessing ? 'Processing…' : 'Open next step'}
-            className="flex items-center gap-2.5 h-12 px-5 rounded-full shadow-xl border border-primary/40 bg-primary text-primary-foreground font-semibold text-sm hover:bg-primary/90 active:scale-95 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+            title="Open next step"
+            className="flex items-center gap-2.5 h-12 px-5 rounded-full shadow-xl border border-primary/40 bg-primary text-primary-foreground font-semibold text-sm hover:bg-primary/90 active:scale-95 transition-all"
           >
-            {isProcessing && <Loader2 className="h-4 w-4 animate-spin" />}
             <span>Progress</span>
-            {!isProcessing && <ChevronRight className="h-4 w-4" />}
+            <ChevronRight className="h-4 w-4" />
           </button>
         </div>
       )}
@@ -716,30 +668,20 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
               <h1 className="text-2xl font-bold text-foreground truncate">{(job.source_name as string) || 'Loading…'}</h1>
               <p className="text-muted-foreground text-sm mt-1 truncate">{job.source_url as string}</p>
             </div>
-
-            {/* Status + actions */}
             <div className="flex items-center gap-2 shrink-0 flex-wrap justify-end">
               <Badge variant={STATUS_VARIANTS[status] ?? 'secondary'} className="h-7 px-3">
                 {isActive && <Loader2 className="h-3 w-3 animate-spin mr-1.5" />}
                 {STATUS_LABELS[status] ?? status}
               </Badge>
-
               {isCancellable && (
-                <button
-                  onClick={handleCancel}
-                  disabled={cancelling || deleting}
-                  className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg text-xs font-semibold border-2 border-amber-500/60 text-amber-500 bg-amber-500/10 hover:bg-amber-500/20 hover:border-amber-500 transition-all disabled:opacity-40"
-                >
+                <button onClick={handleCancel} disabled={cancelling || deleting}
+                  className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg text-xs font-semibold border-2 border-amber-500/60 text-amber-500 bg-amber-500/10 hover:bg-amber-500/20 hover:border-amber-500 transition-all disabled:opacity-40">
                   {cancelling ? <Loader2 className="h-3 w-3 animate-spin" /> : <AlertTriangle className="h-3 w-3" />}
                   {cancelling ? 'Cancelling…' : 'Cancel Job'}
                 </button>
               )}
-
-              <button
-                onClick={handleDelete}
-                disabled={deleting || cancelling}
-                className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg text-xs font-semibold border-2 border-red-500/60 text-red-500 bg-red-500/10 hover:bg-red-500/20 hover:border-red-500 transition-all disabled:opacity-40"
-              >
+              <button onClick={handleDelete} disabled={deleting || cancelling}
+                className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg text-xs font-semibold border-2 border-red-500/60 text-red-500 bg-red-500/10 hover:bg-red-500/20 hover:border-red-500 transition-all disabled:opacity-40">
                 {deleting ? <Loader2 className="h-3 w-3 animate-spin" /> : <Trash2 className="h-3 w-3" />}
                 {deleting ? 'Deleting…' : 'Delete'}
               </button>
@@ -749,33 +691,25 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
           {/* Stats */}
           <div className="grid grid-cols-3 gap-4 mb-8">
             <div className="bg-card border border-border rounded-xl p-5">
-              <div className="text-3xl font-bold text-foreground">{hydrated ? videos.length : <Loader2 className="h-5 w-5 animate-spin inline text-muted-foreground" />}</div>
+              <div className="text-3xl font-bold">{hydrated ? videos.length : <Loader2 className="h-5 w-5 animate-spin inline text-muted-foreground" />}</div>
               <div className="text-sm text-muted-foreground mt-1 font-medium">Videos</div>
             </div>
             <div className="bg-card border border-border rounded-xl p-5">
-              <div className="text-3xl font-bold text-foreground">
-                {transcriptDone}
-                <span className="text-muted-foreground font-normal text-lg"> / {totalVideos}</span>
-              </div>
+              <div className="text-3xl font-bold">{transcriptDone}<span className="text-muted-foreground font-normal text-lg"> / {totalVideos}</span></div>
               <div className="text-sm text-muted-foreground mt-1 font-medium">Transcripts</div>
             </div>
             <div className="bg-card border border-border rounded-xl p-5">
-              <div className="text-3xl font-bold text-foreground">
-                {rewriteDone}
-                <span className="text-muted-foreground font-normal text-lg"> / {totalVideos}</span>
-              </div>
+              <div className="text-3xl font-bold">{rewriteDone}<span className="text-muted-foreground font-normal text-lg"> / {totalVideos}</span></div>
               <div className="text-sm text-muted-foreground mt-1 font-medium">Rewritten</div>
             </div>
           </div>
 
-          {/* Cancelled banner */}
+          {/* Status banners */}
           {status === 'cancelled' && (
             <div className="bg-muted/40 border border-border rounded-xl p-5 mb-6">
-              <p className="font-semibold text-foreground">Job cancelled</p>
+              <p className="font-semibold">Job cancelled</p>
               <p className="text-sm text-muted-foreground mt-1">
-                {transcriptDone > 0
-                  ? `${transcriptDone} transcript(s) extracted before cancellation.`
-                  : 'No transcripts were extracted.'}
+                {transcriptDone > 0 ? `${transcriptDone} transcript(s) extracted before cancellation.` : 'No transcripts were extracted.'}
               </p>
               {transcriptDone > 0 && (
                 <Button size="sm" variant="outline" className="mt-3" onClick={handleExportRaw} disabled={exportingRaw}>
@@ -785,11 +719,10 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
             </div>
           )}
 
-          {/* Completed banner (static, popup handles primary CTA) */}
           {(status === 'completed' || status === 'completed_with_errors') && (
             <div className="bg-gradient-to-r from-green-500/10 to-transparent border border-green-500/30 rounded-xl p-5 mb-6 flex items-center justify-between gap-4">
               <div>
-                <p className="font-semibold text-foreground">🎉 Rewrites ready to export</p>
+                <p className="font-semibold">🎉 Rewrites ready to export</p>
                 <p className="text-sm text-muted-foreground mt-0.5">
                   {rewriteDone} script{rewriteDone !== 1 ? 's' : ''} done.
                   {status === 'completed_with_errors' && <span className="text-amber-500 ml-1">Some videos had errors.</span>}
@@ -806,7 +739,6 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
             </div>
           )}
 
-          {/* Failed banner */}
           {status === 'failed' && (
             <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-5 mb-6">
               <p className="text-red-400 font-semibold flex items-center gap-2"><AlertTriangle className="h-4 w-4" />Job failed</p>
@@ -822,17 +754,11 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
           {/* Video list */}
           <div className="bg-card border border-border rounded-xl overflow-hidden">
             <div className="px-5 py-4 border-b border-border flex items-center justify-between">
-              <h2 className="font-semibold text-foreground">Videos ({hydrated ? videos.length : ((job.total_video_count as number) || '…')})</h2>
+              <h2 className="font-semibold">Videos ({hydrated ? videos.length : ((job.total_video_count as number) || '…')})</h2>
               {!hydrated && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
             </div>
-            {!hydrated && (
-              <div className="flex items-center justify-center py-12">
-                <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
-              </div>
-            )}
-            {hydrated && videos.length === 0 && (
-              <div className="py-12 text-center text-sm text-muted-foreground">No videos found yet.</div>
-            )}
+            {!hydrated && <div className="flex items-center justify-center py-12"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>}
+            {hydrated && videos.length === 0 && <div className="py-12 text-center text-sm text-muted-foreground">No videos found yet.</div>}
             <div className="divide-y divide-border">
               {videos.map((video, index) => {
                 const tStatus = video.transcript_status as string;
@@ -844,40 +770,25 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
                   <div key={video.id as string} className="flex items-center gap-3 px-5 py-3 group hover:bg-muted/30 transition-colors">
                     <span className="text-muted-foreground text-xs w-6 text-right shrink-0 font-mono">{index + 1}</span>
                     <div className="flex-1 min-w-0">
-                      <p className="text-sm text-foreground truncate font-medium">{(video.video_title as string) || (video.video_id as string)}</p>
+                      <p className="text-sm font-medium truncate">{(video.video_title as string) || (video.video_id as string)}</p>
                       {hasTx && typeof video.transcript_word_count === 'number' && (
                         <p className="text-xs text-muted-foreground mt-0.5">{(video.transcript_word_count as number).toLocaleString()} words</p>
                       )}
-                      {tStatus === 'failed' && txError && (
-                        <p className="text-xs text-red-400 mt-0.5 truncate" title={txError}>{txError}</p>
-                      )}
-                      {rStatus === 'failed' && rwError && (
-                        <p className="text-xs text-red-400 mt-0.5 truncate" title={rwError}>{rwError}</p>
-                      )}
+                      {tStatus === 'failed' && txError && <p className="text-xs text-red-400 mt-0.5 truncate" title={txError}>{txError}</p>}
+                      {rStatus === 'failed' && rwError && <p className="text-xs text-red-400 mt-0.5 truncate" title={rwError}>{rwError}</p>}
                     </div>
                     <div className="flex items-center gap-2 shrink-0">
                       <Badge variant={TRANSCRIPT_VARIANTS[tStatus] ?? 'secondary'} className="text-xs">
-                        {tStatus === 'done' ? '✓ Transcript'
-                          : tStatus === 'failed' ? '✗ Failed'
-                          : tStatus === 'skipped' ? '— Skipped'
-                          : tStatus === 'processing' ? 'Extracting…'
-                          : 'Pending'}
+                        {tStatus === 'done' ? '✓ Transcript' : tStatus === 'failed' ? '✗ Failed' : tStatus === 'skipped' ? '— Skipped' : tStatus === 'processing' ? 'Extracting…' : 'Pending'}
                       </Badge>
                       {rStatus && rStatus !== 'not_started' && (
                         <Badge variant={REWRITE_VARIANTS[rStatus] ?? 'secondary'} className="text-xs">
-                          {rStatus === 'done' ? '✓ Rewritten'
-                            : rStatus === 'failed' ? '✗ Failed'
-                            : rStatus === 'processing' ? 'Rewriting…'
-                            : rStatus === 'queued' ? 'Queued'
-                            : rStatus}
+                          {rStatus === 'done' ? '✓ Rewritten' : rStatus === 'failed' ? '✗ Failed' : rStatus === 'processing' ? 'Rewriting…' : rStatus === 'queued' ? 'Queued' : rStatus}
                         </Badge>
                       )}
                       {hasTx && (
-                        <button
-                          onClick={() => setViewingVideo(video)}
-                          title="View transcript"
-                          className="p-1.5 rounded-lg text-muted-foreground hover:text-primary hover:bg-primary/10 transition-colors opacity-0 group-hover:opacity-100 focus:opacity-100"
-                        >
+                        <button onClick={() => setViewingVideo(video)} title="View transcript"
+                          className="p-1.5 rounded-lg text-muted-foreground hover:text-primary hover:bg-primary/10 transition-colors opacity-0 group-hover:opacity-100 focus:opacity-100">
                           <FileText className="h-4 w-4" />
                         </button>
                       )}

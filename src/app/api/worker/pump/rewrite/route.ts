@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import type { ApiResponse } from '@/types';
 
-const BATCH_SIZE = 3;
+const BATCH_SIZE = 2; // Reduced from 3 to stay under rate limits
 const MAX_RETRIES = 3;
 
 export async function POST(req: NextRequest) {
@@ -32,13 +32,16 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // --- Authoritative snapshot BEFORE claiming ---
+    const now = new Date().toISOString();
+
+    // Count videos that are queued AND whose backoff window has passed
     const { count: currentQueued } = await admin
       .from('job_videos')
       .select('*', { count: 'exact', head: true })
       .eq('job_id', job_id)
       .eq('rewrite_status', 'queued')
-      .lt('rewrite_retry_count', MAX_RETRIES);
+      .lt('rewrite_retry_count', MAX_RETRIES)
+      .or(`rewrite_not_before.is.null,rewrite_not_before.lte.${now}`);
 
     const { count: currentProcessing } = await admin
       .from('job_videos')
@@ -46,8 +49,26 @@ export async function POST(req: NextRequest) {
       .eq('job_id', job_id)
       .eq('rewrite_status', 'processing');
 
-    // Nothing queued AND nothing processing — all rewrites done, advance job
+    // Count videos still in backoff (queued but not ready yet)
+    const { count: inBackoff } = await admin
+      .from('job_videos')
+      .select('*', { count: 'exact', head: true })
+      .eq('job_id', job_id)
+      .eq('rewrite_status', 'queued')
+      .not('rewrite_not_before', 'is', null)
+      .gt('rewrite_not_before', now);
+
+    // Nothing ready AND nothing processing — check if truly done
     if ((currentQueued ?? 0) === 0 && (currentProcessing ?? 0) === 0) {
+      // If some are still in backoff, report waiting
+      if ((inBackoff ?? 0) > 0) {
+        return NextResponse.json<ApiResponse>({
+          success: true,
+          data: { processed: 0, remaining: inBackoff ?? 0, waiting: true, message: 'Rate-limit backoff in progress' },
+        });
+      }
+
+      // All done — advance job status
       const { count: successCount } = await admin
         .from('job_videos')
         .select('*', { count: 'exact', head: true })
@@ -65,12 +86,11 @@ export async function POST(req: NextRequest) {
         .update({
           status: 'building_export',
           rewrite_success_count: successCount ?? 0,
-          rewrite_failed_count: failedCount ?? 0,
+          rewrite_failed_count:  failedCount  ?? 0,
         })
         .eq('id', job_id)
         .in('status', ['rewriting', 'queued_for_rewrite']);
 
-      // Trigger export generation (fire-and-forget)
       const baseUrl = process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000';
       fetch(`${baseUrl}/api/jobs/${job_id}/export`, { method: 'POST' }).catch(() => {});
 
@@ -80,7 +100,7 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // Nothing queued but some still processing — wait
+    // Nothing ready but some still processing — wait
     if ((currentQueued ?? 0) === 0 && (currentProcessing ?? 0) > 0) {
       return NextResponse.json<ApiResponse>({
         success: true,
@@ -88,43 +108,45 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // Claim next batch
+    // Claim next ready batch (respects backoff: only grab ones where not_before <= now)
     const { data: batch } = await admin
       .from('job_videos')
       .select('id, video_id')
       .eq('job_id', job_id)
       .eq('rewrite_status', 'queued')
       .lt('rewrite_retry_count', MAX_RETRIES)
+      .or(`rewrite_not_before.is.null,rewrite_not_before.lte.${now}`)
       .order('discovery_position', { ascending: true })
       .limit(BATCH_SIZE);
 
     if (!batch || batch.length === 0) {
+      const remaining = (currentProcessing ?? 0) + (inBackoff ?? 0);
       return NextResponse.json<ApiResponse>({
         success: true,
-        data: { processed: 0, remaining: currentProcessing ?? 0 },
+        data: { processed: 0, remaining, waiting: remaining > 0 },
       });
     }
 
     await admin
       .from('job_videos')
       .update({
-        rewrite_status: 'processing',
+        rewrite_status:      'processing',
         rewrite_attempted_at: new Date().toISOString(),
+        rewrite_not_before:  null, // clear backoff
       })
-      .in('id', batch.map(v => v.id));
+      .in('id', batch.map((v: { id: string }) => v.id));
 
     const baseUrl = process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000';
     await Promise.allSettled(
-      batch.map(video =>
+      batch.map((video: { id: string; video_id: string }) =>
         fetch(`${baseUrl}/api/worker/rewrite`, {
-          method: 'POST',
+          method:  'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ job_id, job_video_id: video.id, video_id: video.video_id }),
+          body:    JSON.stringify({ job_id, job_video_id: video.id, video_id: video.video_id }),
         })
       )
     );
 
-    // Post-batch authoritative count
     const { count: queuedAfter } = await admin
       .from('job_videos')
       .select('*', { count: 'exact', head: true })
@@ -137,12 +159,11 @@ export async function POST(req: NextRequest) {
       .eq('job_id', job_id)
       .eq('rewrite_status', 'processing');
 
-    const remaining = (queuedAfter ?? 0) + (processingAfter ?? 0);
-
     return NextResponse.json<ApiResponse>({
       success: true,
-      data: { processed: batch.length, remaining },
+      data: { processed: batch.length, remaining: (queuedAfter ?? 0) + (processingAfter ?? 0) },
     });
+
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Rewrite pump failed';
     return NextResponse.json<ApiResponse>({ success: false, error: message }, { status: 500 });

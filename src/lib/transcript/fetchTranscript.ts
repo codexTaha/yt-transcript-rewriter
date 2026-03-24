@@ -32,27 +32,38 @@ export async function fetchTranscript(
   proxy?: string,
   timeoutMs = 30_000
 ): Promise<TranscriptResult> {
-  // Auto-resolve proxy: explicit arg > PROXY_URL env var
   const resolvedProxy = proxy ?? resolveProxyFromEnv();
 
   const args: string[] = [SCRIPT_PATH, videoId];
   if (resolvedProxy) args.push(resolvedProxy);
 
+  // Log what proxy is being used (helpful for debugging)
+  console.log(`[fetchTranscript] video=${videoId} proxy=${resolvedProxy ?? '(none)'}`);
+
   let stdout: string;
+  let stderr: string = '';
   try {
     const result = await execFileAsync(PYTHON, args, {
       timeout: timeoutMs,
-      maxBuffer: 10 * 1024 * 1024, // 10 MB
+      maxBuffer: 10 * 1024 * 1024,
     });
     stdout = result.stdout;
+    stderr = result.stderr ?? '';
   } catch (err: unknown) {
-    const e = err as { stdout?: string; stderr?: string; message?: string };
+    const e = err as { stdout?: string; stderr?: string; message?: string; killed?: boolean; code?: string };
     stdout = e.stdout ?? '';
+    stderr = e.stderr ?? '';
     if (!stdout.trim()) {
+      const killed = e.killed ? ' (process killed — timeout?)' : '';
+      const stderrDetail = stderr.trim() ? `\nstderr: ${stderr.slice(0, 500)}` : '';
       throw new Error(
-        `Python script failed: ${e.stderr?.slice(0, 200) ?? e.message ?? 'unknown error'}`
+        `Python script failed${killed}: ${e.message ?? 'unknown error'}${stderrDetail}`
       );
     }
+  }
+
+  if (stderr.trim()) {
+    console.warn(`[fetchTranscript] stderr for ${videoId}: ${stderr.slice(0, 300)}`);
   }
 
   let parsed: { success: boolean; text?: string; language?: string; error?: string };
@@ -81,7 +92,6 @@ export async function fetchTranscript(
 function resolveProxyFromEnv(): string | undefined {
   const raw = process.env.PROXY_URL?.trim();
   if (!raw) return undefined;
-
   // Strip scheme (http:// or https://) — Python script prepends its own
   const stripped = raw.replace(/^https?:\/\//i, '');
   return stripped || undefined;

@@ -26,17 +26,21 @@ def fetch(video_id: str, proxy: str = None) -> dict:
         return {"success": False, "error": "youtube-transcript-api not installed. Run: pip install youtube-transcript-api"}
 
     try:
-        # Build API instance with optional proxy (same pattern as ytbsd.py)
+        # Build API instance — same pattern as roundyyy/yt-bulk-subtitles-downloader
         if proxy:
+            proxy_url = f"http://{proxy}"
             try:
                 from youtube_transcript_api.proxies import GenericProxyConfig
-                proxy_url = f"http://{proxy}"
                 proxy_config = GenericProxyConfig(http_url=proxy_url, https_url=proxy_url)
                 ytt_api = YouTubeTranscriptApi(proxy_config=proxy_config)
+                print(f"[fetch_transcript] using GenericProxyConfig proxy={proxy_url}", file=sys.stderr)
             except ImportError:
-                # Older version of youtube-transcript-api — no proxy config class
+                # Older youtube-transcript-api (<= 0.6.x) — no proxies module
+                # Fall back to no proxy rather than crashing
+                print(f"[fetch_transcript] WARNING: GenericProxyConfig not available (old api version), ignoring proxy", file=sys.stderr)
                 ytt_api = YouTubeTranscriptApi()
         else:
+            print("[fetch_transcript] no proxy, using direct connection", file=sys.stderr)
             ytt_api = YouTubeTranscriptApi()
 
         transcript_list = ytt_api.list(video_id)
@@ -44,7 +48,7 @@ def fetch(video_id: str, proxy: str = None) -> dict:
         transcript = None
         lang_info = None
 
-        # 1. Try English first (same order as ytbsd.py)
+        # 1. Try English first
         try:
             transcript = transcript_list.find_transcript(["en"])
             lang_type = "auto-generated" if transcript.is_generated else "manual"
@@ -72,17 +76,13 @@ def fetch(video_id: str, proxy: str = None) -> dict:
         if transcript is None:
             return {"success": False, "error": "No transcript available in any language"}
 
-        # Fetch the actual content (same as ytbsd.py fetch_content_with_timeout)
         fetched = transcript.fetch()
-        # FetchedTranscript is iterable of FetchedTranscriptSnippet
-        # Each snippet has .text attribute
         try:
             text = " ".join(snippet.text for snippet in fetched)
         except AttributeError:
-            # Older API returns list of dicts
             text = " ".join(item.get("text", "") for item in fetched)
 
-        text = " ".join(text.split())  # Normalize whitespace
+        text = " ".join(text.split())
 
         if len(text) < 50:
             return {"success": False, "error": "Transcript too short or empty"}

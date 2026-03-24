@@ -74,19 +74,17 @@ export function JobDetailClient({
   const [submittingPrompt, setSubmittingPrompt] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [cancelling, setCancelling] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
-  // Ref so the pump loop always sees the latest status without re-creating the effect
   const statusRef = useRef<string>(initialJob.status as string);
 
   const jobId = job.id as string;
   const status = job.status as string;
 
-  // Keep statusRef in sync
   useEffect(() => {
     statusRef.current = status;
   }, [status]);
 
-  // Realtime: subscribe to job row changes
   useEffect(() => {
     const supabase = createClient();
     const channel = supabase
@@ -118,11 +116,9 @@ export function JobDetailClient({
     return () => { supabase.removeChannel(channel); };
   }, [jobId]);
 
-  // Pump loop — stops automatically when job is cancelled or status changes
   const pump = useCallback(async (endpoint: string) => {
     let remaining = 999;
     while (remaining > 0) {
-      // Stop if job was cancelled or moved away from the pumping status
       if (
         statusRef.current === 'cancelled' ||
         (endpoint.includes('extract') && statusRef.current !== 'extracting') ||
@@ -145,7 +141,6 @@ export function JobDetailClient({
     }
   }, [jobId]);
 
-  // Auto-start pump when status is extracting/rewriting
   useEffect(() => {
     if (status === 'extracting') {
       pump('/api/worker/pump/extract');
@@ -195,13 +190,27 @@ export function JobDetailClient({
       const data = await res.json();
       if (!data.success) throw new Error(data.error);
       toast.success('Job cancelled');
-      // Optimistically update local state so the button disappears immediately
       setJob(prev => ({ ...prev, status: 'cancelled' }));
       router.refresh();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Failed to cancel job');
     } finally {
       setCancelling(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!confirm('Permanently delete this job and ALL its data (videos, transcripts, rewrites)? This cannot be undone.')) return;
+    setDeleting(true);
+    try {
+      const res = await fetch(`/api/jobs/${jobId}/delete`, { method: 'DELETE' });
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error);
+      toast.success('Job deleted');
+      router.push('/dashboard');
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to delete job');
+      setDeleting(false);
     }
   };
 
@@ -226,7 +235,7 @@ export function JobDetailClient({
             </h1>
             <p className="text-muted-foreground text-sm mt-1">{job.source_url as string}</p>
           </div>
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2">
             <Badge variant={STATUS_VARIANTS[status] ?? 'secondary'}>
               {STATUS_LABELS[status] ?? status}
             </Badge>
@@ -235,12 +244,21 @@ export function JobDetailClient({
                 variant="outline"
                 size="sm"
                 onClick={handleCancel}
-                disabled={cancelling}
+                disabled={cancelling || deleting}
                 className="text-destructive border-destructive/40 hover:bg-destructive/10 hover:text-destructive"
               >
-                {cancelling ? 'Cancelling...' : 'Cancel Job'}
+                {cancelling ? 'Cancelling...' : 'Cancel'}
               </Button>
             )}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleDelete}
+              disabled={deleting || cancelling}
+              className="text-destructive border-destructive/40 hover:bg-destructive/10 hover:text-destructive"
+            >
+              {deleting ? 'Deleting...' : '🗑 Delete Job'}
+            </Button>
           </div>
         </div>
 
@@ -269,12 +287,14 @@ export function JobDetailClient({
           <div className="bg-muted/40 border border-border rounded-lg p-5 mb-8">
             <p className="font-medium text-foreground">Job cancelled</p>
             <p className="text-sm text-muted-foreground mt-1">
-              This job was cancelled. {transcriptDone > 0 ? `${transcriptDone} transcript(s) were extracted before cancellation.` : 'No transcripts were extracted.'}
+              This job was cancelled. {transcriptDone > 0
+                ? `${transcriptDone} transcript(s) were extracted before cancellation.`
+                : 'No transcripts were extracted.'}
             </p>
           </div>
         )}
 
-        {/* Prompt box — shown when awaiting prompt */}
+        {/* Prompt box */}
         {status === 'awaiting_prompt' && (
           <div className="bg-card border border-border rounded-lg p-6 mb-8">
             <h2 className="text-lg font-semibold text-foreground mb-1">Enter your rewrite prompt</h2>

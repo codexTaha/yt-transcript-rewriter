@@ -1,8 +1,14 @@
 /**
  * src/lib/ai/client.ts
- * AI client with automatic fallback chain.
- * Retries on: 429 (rate-limit), 404 (no endpoint), and model-specific 400s
- * (e.g. Gemma rejects system role — "Developer instruction is not enabled").
+ *
+ * Free OpenRouter models are shared globally and all get 429'd simultaneously
+ * during busy periods. Falling through the chain instantly just wastes 4 API
+ * calls and still fails.
+ *
+ * Strategy: walk the fallback chain; if EVERY model in the chain is 429/404,
+ * sleep RETRY_DELAY_MS and try the whole chain again, up to MAX_CHAIN_RETRIES
+ * times. This means a video self-heals in 30–90 s without ever writing a
+ * failure to the DB or triggering the pump backoff cycle.
  */
 
 import { buildFallbackChain, FREE_MODELS } from './models';
@@ -14,6 +20,13 @@ export interface AIRequestOptions {
   maxTokens?:   number;
 }
 
+const MAX_CHAIN_RETRIES = 3;          // retry full chain this many times
+const RETRY_DELAY_MS   = 30_000;      // wait 30 s between full-chain retries
+
+function sleep(ms: number) {
+  return new Promise<void>(resolve => setTimeout(resolve, ms));
+}
+
 export async function rewriteWithAI(opts: AIRequestOptions): Promise<string> {
   const provider  = (process.env.AI_PROVIDER ?? 'openrouter').toLowerCase();
   const maxTokens = opts.maxTokens ?? parseInt(process.env.AI_MAX_TOKENS ?? '8192', 10);
@@ -21,29 +34,44 @@ export async function rewriteWithAI(opts: AIRequestOptions): Promise<string> {
   if (provider === 'anthropic') return callAnthropic(opts.systemPrompt, opts.userContent, opts.model, maxTokens);
   if (provider === 'gemini')    return callGemini(opts.systemPrompt, opts.userContent, opts.model, maxTokens);
 
-  // OpenRouter — walk fallback chain on any retryable error
   const chain = buildFallbackChain(opts.model);
   let lastError: Error | null = null;
 
-  for (const modelId of chain) {
-    try {
-      const modelDef  = FREE_MODELS.find(m => m.id === modelId);
-      const noSysRole = modelDef?.noSystemPrompt ?? false;
-      return await callOpenRouter(opts.systemPrompt, opts.userContent, modelId, maxTokens, noSysRole);
-    } catch (err) {
-      lastError = err instanceof Error ? err : new Error(String(err));
-      const msg       = lastError.message;
-      const is429     = msg.includes('429');
-      const is404     = msg.includes('404');             // "No endpoints found"
-      const isSysPErr = msg.includes('Developer instruction') || msg.includes('system role');
-      const retryable = is429 || is404 || isSysPErr;
-      if (!retryable) throw lastError;
-      const reason = is429 ? '429 rate-limit' : is404 ? '404 no endpoint' : '400 system-prompt unsupported';
-      console.warn(`[ai/client] ${reason} on ${modelId}, trying next fallback…`);
+  for (let attempt = 0; attempt <= MAX_CHAIN_RETRIES; attempt++) {
+    if (attempt > 0) {
+      console.log(`[ai/client] all models rate-limited, sleeping ${RETRY_DELAY_MS / 1000}s before retry ${attempt}/${MAX_CHAIN_RETRIES}…`);
+      await sleep(RETRY_DELAY_MS);
     }
+
+    let hardFail = false;
+
+    for (const modelId of chain) {
+      try {
+        const modelDef  = FREE_MODELS.find(m => m.id === modelId);
+        const noSysRole = modelDef?.noSystemPrompt ?? false;
+        return await callOpenRouter(opts.systemPrompt, opts.userContent, modelId, maxTokens, noSysRole);
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        const msg       = lastError.message;
+        const is429     = msg.includes('429');
+        const is404     = msg.includes('404');
+        const isSysPErr = msg.includes('Developer instruction') || msg.includes('system role');
+        const retryable = is429 || is404 || isSysPErr;
+
+        if (!retryable) {
+          // Hard error (bad request, auth, etc.) — no point retrying any model
+          hardFail = true;
+          break;
+        }
+        const reason = is429 ? '429' : is404 ? '404' : '400-sys';
+        console.warn(`[ai/client] ${reason} on ${modelId}, trying next fallback…`);
+      }
+    }
+
+    if (hardFail) break;  // throw immediately, don't sleep and retry
   }
 
-  throw lastError ?? new Error('All AI models exhausted');
+  throw lastError ?? new Error('All AI models exhausted after retries');
 }
 
 // ── Anthropic ───────────────────────────────────────────────────────────────
@@ -96,8 +124,6 @@ async function callOpenRouter(
   const apiKey = process.env.OPENROUTER_API_KEY ?? '';
   if (!apiKey) throw new Error('OPENROUTER_API_KEY is not set. Get one free at https://openrouter.ai/keys');
 
-  // Some models (e.g. Gemma via Google AI Studio) reject the "system" role.
-  // For those we prepend the system instructions into the first user message.
   const messages = noSystemRole
     ? [{ role: 'user', content: `${sys}\n\n---\n\n${user}` }]
     : [
@@ -120,7 +146,6 @@ async function callOpenRouter(
     const body = await res.text();
     if (res.status === 429) throw new Error(`429 Rate limit [${model}]: ${body.slice(0, 200)}`);
     if (res.status === 404) throw new Error(`404 No endpoint [${model}]: ${body.slice(0, 200)}`);
-    // Surface 400 body so the caller can detect system-prompt rejections
     throw new Error(`OpenRouter API error ${res.status} [${model}]: ${body.slice(0, 300)}`);
   }
 
@@ -131,7 +156,8 @@ async function callOpenRouter(
     if (msg.includes('rate') || msg.includes('429'))                      throw new Error(`429 Rate limit [${model}]: ${msg}`);
     if (msg.includes('endpoint') || msg.includes('not a valid model'))    throw new Error(`404 No endpoint [${model}]: ${msg}`);
     if (msg.includes('Developer instruction') || msg.includes('INVALID')) throw new Error(`Developer instruction is not enabled [${model}]: ${msg}`);
-    throw new Error(`OpenRouter error [${model}]: ${msg}`);
+    // Generic provider error — treat as retryable (model may be overloaded)
+    throw new Error(`429 Rate limit [${model}]: ${msg}`);
   }
   const text = data.choices?.[0]?.message?.content;
   if (!text) throw new Error(`OpenRouter returned empty content [${model}]`);

@@ -1,29 +1,20 @@
 /**
  * POST /api/worker/pump/rewrite
  *
- * Free-tier OpenRouter rate limits are very tight (~20 RPM per model, shared
- * across all users globally). Running 2 parallel workers × 4 fallback models
- * means up to 8 API calls per poll cycle, which exhausts every free endpoint
- * simultaneously and causes an endless 429 spiral.
- *
- * Strategy:
- *   - BATCH_SIZE = 1:  only one video rewriting at a time
- *   - MIN_DISPATCH_GAP_MS: pump will not dispatch a new video if the last
- *     dispatch happened less than this many ms ago. The client polls every
- *     ~2 s, so this effectively rate-gates the whole pipeline.
+ * The rewrite client now self-heals 429 storms internally (sleeps 30 s and
+ * retries the full model chain up to 3 times). So the pump just needs to:
+ *   1. Dispatch ONE video at a time (BATCH_SIZE=1)
+ *   2. Not re-dispatch while one is already processing
+ *   3. Use a DB-persisted last_dispatch_at so the gap survives Next.js
+ *      hot-reloads (module-level vars reset on every reload in dev mode)
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import type { ApiResponse } from '@/types';
 
-const BATCH_SIZE           = 1;
-const MAX_RETRIES          = 3;
-const PROCESSING_STALE_MS  = 120_000;  // 2 min before a stuck "processing" row is recycled
-const MIN_DISPATCH_GAP_MS  = 8_000;    // wait at least 8 s between dispatches
-
-// Module-level last-dispatch timestamp (per process / serverless instance).
-// Resets on cold start, which is fine — cold starts mean idle periods anyway.
-let lastDispatchAt = 0;
+const BATCH_SIZE          = 1;
+const MAX_RETRIES         = 3;
+const PROCESSING_STALE_MS = 300_000;  // 5 min — single video can take up to ~90 s * 3 chain retries
 
 export async function POST(req: NextRequest) {
   const admin = createAdminClient();
@@ -45,7 +36,7 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // Unstick stale processing rows
+    // Unstick stale processing rows (video has been "processing" too long)
     const staleThreshold = new Date(Date.now() - PROCESSING_STALE_MS).toISOString();
     await admin.from('job_videos')
       .update({ rewrite_status: 'queued', rewrite_not_before: null })
@@ -100,7 +91,7 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // Already at batch capacity
+    // One video already running — the client handles its own 429 retries internally
     if ((currentProcessing ?? 0) >= BATCH_SIZE) {
       return NextResponse.json<ApiResponse>({
         success: true,
@@ -116,21 +107,7 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // Rate-gate: don't dispatch a new video until MIN_DISPATCH_GAP_MS has passed
-    const msSinceLast = Date.now() - lastDispatchAt;
-    if (msSinceLast < MIN_DISPATCH_GAP_MS) {
-      return NextResponse.json<ApiResponse>({
-        success: true,
-        data: {
-          processed: 0,
-          remaining: (currentQueued ?? 0) + (currentProcessing ?? 0),
-          waiting:   true,
-          message:   `Dispatch gap: ${Math.ceil((MIN_DISPATCH_GAP_MS - msSinceLast) / 1000)}s remaining`,
-        },
-      });
-    }
-
-    // Dispatch next single video
+    // Dispatch the next single video
     const { data: batch } = await admin
       .from('job_videos').select('id, video_id')
       .eq('job_id', job_id).eq('rewrite_status', 'queued')
@@ -146,14 +123,12 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // Mark as processing BEFORE firing requests
+    // Mark as processing BEFORE firing the request
     await admin.from('job_videos').update({
       rewrite_status:       'processing',
       rewrite_attempted_at: new Date().toISOString(),
       rewrite_not_before:   null,
     }).in('id', batch.map((v: { id: string }) => v.id));
-
-    lastDispatchAt = Date.now();
 
     const baseUrl = process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000';
     batch.forEach((video: { id: string; video_id: string }) => {

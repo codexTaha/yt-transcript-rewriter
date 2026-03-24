@@ -1,16 +1,26 @@
 /**
  * src/lib/export/assembler.ts
- * Bundle assembler utility — Phase 5.1
- * Builds the final Markdown export from job + video data.
+ * Builds two plain-text export bundles:
+ *   - raw_transcripts.txt    (original transcripts)
+ *   - rewritten_transcripts.txt  (AI-rewritten transcripts)
+ *
+ * Format per video:
+ *   Video N — Title
+ *   URL: https://...
+ *   Duration: Xh Ym
+ *   ──────────────────────────────────────────────────────────────────────
+ *   <transcript text>
+ *   ──────────────────────────────────────────────────────────────────────
+ *   (blank line between videos)
  */
 
 export interface AssemblerJob {
-  source_name?:   string | null;
-  source_url:     string;
-  master_prompt?: string | null;
-  ai_model?:      string | null;
-  created_at?:    string | null;
-  completed_at?:  string | null;
+  source_name?:              string | null;
+  source_url:                string;
+  master_prompt?:            string | null;
+  ai_model?:                 string | null;
+  created_at?:               string | null;
+  completed_at?:             string | null;
   transcript_success_count?: number;
   transcript_failed_count?:  number;
   rewrite_success_count?:    number;
@@ -18,111 +28,127 @@ export interface AssemblerJob {
 }
 
 export interface AssemblerVideo {
-  video_id:                string;
-  video_title?:            string | null;
-  discovery_position?:     number;
-  transcript_status:       string;
-  rewrite_status:          string;
-  transcript_word_count?:  number | null;
-  rewrite_chunk_count?:    number | null;
-  rewrite_model_used?:     string | null;
-  rewritten_content?:      string | null; // already loaded by caller
-  transcript_error?:       string | null;
-  rewrite_error?:          string | null;
+  video_id:               string;
+  video_title?:           string | null;
+  discovery_position?:    number;
+  duration_seconds?:      number | null;
+  transcript_status:      string;
+  rewrite_status:         string;
+  transcript_word_count?: number | null;
+  rewrite_chunk_count?:   number | null;
+  rewrite_model_used?:    string | null;
+  raw_content?:           string | null;  // original transcript
+  rewritten_content?:     string | null;  // AI rewrite
+  transcript_error?:      string | null;
+  rewrite_error?:         string | null;
 }
 
-/**
- * Assemble the complete Markdown bundle string.
- * The caller is responsible for loading rewritten_content from storage.
- */
-export function assembleBundleMd(
-  job:    AssemblerJob,
-  videos: AssemblerVideo[]
-): string {
-  const done    = videos.filter(v => v.rewrite_status === 'done');
-  const failed  = videos.filter(v => v.rewrite_status === 'failed');
-  const skipped = videos.filter(v => v.transcript_status === 'skipped' || v.transcript_status === 'failed');
+const DIVIDER = '─'.repeat(70);
+
+function formatDuration(sec: number | null | undefined): string {
+  if (!sec) return 'unknown';
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+function buildHeader(job: AssemblerJob, label: string): string[] {
+  const lines: string[] = [];
+  lines.push(`${label}`);
+  lines.push(`Source : ${job.source_name ?? 'YouTube'} — ${job.source_url}`);
+  lines.push(`Model  : ${job.ai_model ?? '—'}`);
+  lines.push(`Date   : ${new Date().toUTCString()}`);
+  lines.push(DIVIDER);
+  lines.push('');
+  return lines;
+}
+
+function videoBlock(
+  video:   AssemblerVideo,
+  index:   number,
+  content: string | null | undefined,
+  label:   string
+): string[] {
+  const title    = video.video_title ?? video.video_id;
+  const url      = `https://www.youtube.com/watch?v=${video.video_id}`;
+  const duration = formatDuration(video.duration_seconds);
 
   const lines: string[] = [];
+  lines.push(`Video ${index} — ${title}`);
+  lines.push(`URL      : ${url}`);
+  lines.push(`Duration : ${duration}`);
+  if (video.transcript_word_count) {
+    lines.push(`Words    : ${video.transcript_word_count.toLocaleString()}`);
+  }
+  lines.push(DIVIDER);
+  lines.push('');
+  if (content?.trim()) {
+    lines.push(content.trim());
+  } else {
+    lines.push(`[${label} unavailable — ${video.transcript_error ?? video.rewrite_error ?? 'no content'}]`);
+  }
+  lines.push('');
+  lines.push(DIVIDER);
+  lines.push('');
+  lines.push('');
+  return lines;
+}
 
-  // ── Title block ────────────────────────────────────────────────────────────
-  lines.push(
-    `# ${job.source_name ?? 'YouTube Transcript Bundle'}`,
-    '',
-    `| Field | Value |`,
-    `|---|---|`,
-    `| **Source** | ${job.source_url} |`,
-    `| **Prompt** | ${job.master_prompt ?? '—'} |`,
-    `| **Model** | ${job.ai_model ?? '—'} |`,
-    `| **Generated** | ${new Date().toUTCString()} |`,
-    `| **Rewritten** | ${done.length} / ${videos.length} videos |`,
-    `| **Failed rewrites** | ${failed.length} |`,
-    `| **No transcript** | ${skipped.length} |`,
-    '',
-    '---',
-    ''
-  );
+/** Build raw_transcripts.txt */
+export function assembleRawTxt(job: AssemblerJob, videos: AssemblerVideo[]): string {
+  const lines = buildHeader(job, 'RAW TRANSCRIPTS');
+  const withTranscript = videos.filter(v => v.transcript_status === 'done' || v.raw_content);
+  if (withTranscript.length === 0) {
+    lines.push('[No transcripts available]');
+    return lines.join('\n');
+  }
+  withTranscript.forEach((v, i) => {
+    lines.push(...videoBlock(v, i + 1, v.raw_content, 'transcript'));
+  });
+  return lines.join('\n');
+}
 
-  // ── Table of Contents ──────────────────────────────────────────────────────
-  if (done.length > 0) {
-    lines.push('## Table of Contents', '');
-    done.forEach((v, i) => {
-      const title  = v.video_title ?? v.video_id;
-      const anchor = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-      lines.push(`${i + 1}. [${title}](#${anchor})`);
-    });
-    lines.push('', '---', '');
+/** Build rewritten_transcripts.txt */
+export function assembleRewrittenTxt(job: AssemblerJob, videos: AssemblerVideo[]): string {
+  const lines = buildHeader(job, 'REWRITTEN TRANSCRIPTS');
+  const done    = videos.filter(v => v.rewrite_status === 'done');
+  const failed  = videos.filter(v => v.rewrite_status === 'failed');
+  const skipped = videos.filter(v => !['done', 'failed'].includes(v.rewrite_status));
+
+  if (done.length === 0) {
+    lines.push('[No rewritten transcripts available]');
+    return lines.join('\n');
   }
 
-  // ── Rewritten sections ─────────────────────────────────────────────────────
-  for (const video of done) {
-    const title = video.video_title ?? video.video_id;
-    lines.push(
-      `## ${title}`,
-      '',
-      `**URL:** https://www.youtube.com/watch?v=${video.video_id}`,
-    );
-    if (video.transcript_word_count) {
-      lines.push(`**Original word count:** ${video.transcript_word_count.toLocaleString()}`);
-    }
-    if (video.rewrite_chunk_count && video.rewrite_chunk_count > 1) {
-      lines.push(`**Chunks:** ${video.rewrite_chunk_count}`);
-    }
-    lines.push(
-      '',
-      (video.rewritten_content ?? '*(rewritten content unavailable)*').trim(),
-      '',
-      '---',
-      ''
-    );
-  }
+  done.forEach((v, i) => {
+    lines.push(...videoBlock(v, i + 1, v.rewritten_content, 'rewrite'));
+  });
 
-  // ── Failed rewrites ────────────────────────────────────────────────────────
   if (failed.length > 0) {
-    lines.push('## ⚠️ Rewrite Failed', '');
-    for (const video of failed) {
-      lines.push(
-        `### ${video.video_title ?? video.video_id}`,
-        `**URL:** https://www.youtube.com/watch?v=${video.video_id}`,
-        `**Error:** ${video.rewrite_error ?? 'Unknown error'}`,
-        ''
-      );
-    }
-    lines.push('---', '');
+    lines.push('FAILED REWRITES');
+    lines.push(DIVIDER);
+    failed.forEach(v => {
+      lines.push(`• Video ${v.discovery_position ?? '?'} — ${v.video_title ?? v.video_id}`);
+      lines.push(`  Error: ${v.rewrite_error ?? 'unknown'}`);
+    });
+    lines.push('');
   }
 
-  // ── No-transcript videos ───────────────────────────────────────────────────
   if (skipped.length > 0) {
-    lines.push('## ❌ Transcript Unavailable', '');
-    for (const video of skipped) {
-      lines.push(
-        `### ${video.video_title ?? video.video_id}`,
-        `**URL:** https://www.youtube.com/watch?v=${video.video_id}`,
-        video.transcript_error ? `**Reason:** ${video.transcript_error}` : '**Reason:** No captions available',
-        ''
-      );
-    }
+    lines.push('NO TRANSCRIPT AVAILABLE');
+    lines.push(DIVIDER);
+    skipped.forEach(v => {
+      lines.push(`• ${v.video_title ?? v.video_id} — ${v.transcript_error ?? 'no captions'}`);
+    });
   }
 
   return lines.join('\n');
+}
+
+// Keep old function for backward compatibility during transition
+export function assembleBundleMd(job: AssemblerJob, videos: AssemblerVideo[]): string {
+  return assembleRewrittenTxt(job, videos);
 }

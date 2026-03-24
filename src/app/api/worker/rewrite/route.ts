@@ -9,6 +9,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { rewriteWithAI } from '@/lib/ai/client';
 import { chunkTranscript, mergeChunks } from '@/lib/ai/chunker';
+import { sanitizeModelId } from '@/lib/ai/models';
 import type { ApiResponse } from '@/types';
 
 export const maxDuration = 60;
@@ -89,7 +90,17 @@ export async function POST(req: NextRequest) {
       return NextResponse.json<ApiResponse>({ success: false, error: 'Empty transcript' }, { status: 422 });
     }
 
-    const model  = (job.ai_model as string | null) ?? process.env.AI_MODEL ?? 'claude-3-5-sonnet-20241022';
+    // sanitizeModelId substitutes any stale/unknown model ID from old DB rows
+    // (e.g. mistralai/mistral-7b-instruct:free) with the current default.
+    const rawModel = (job.ai_model as string | null) ?? process.env.AI_MODEL ?? null;
+    const model    = sanitizeModelId(rawModel);
+
+    if (rawModel !== model) {
+      console.log(`[rewrite worker] stale model "${rawModel ?? 'null'}" → replaced with "${model}"`);
+      // Persist the corrected model so subsequent retries use the right one
+      await admin.from('jobs').update({ ai_model: model }).eq('id', job_id);
+    }
+
     const chunks = chunkTranscript(transcriptText);
     const rewrittenParts: string[] = [];
 
@@ -138,22 +149,19 @@ export async function POST(req: NextRequest) {
         const is429      = message.includes('429');
 
         if (retryCount >= 3 || !is429) {
-          // Permanent failure — either exhausted retries or a non-rate-limit error
           await admin.from('job_videos').update({
             rewrite_status:      'failed',
             rewrite_error:       message,
             rewrite_retry_count: retryCount,
           }).eq('id', job_video_id);
         } else {
-          // 429 rate limit — put back to queued but stamp a "not_before" time
-          // so the pump skips it until the backoff window has passed.
-          const backoffMs   = BACKOFF_MS[retryCount - 1] ?? 120_000;
-          const notBefore   = new Date(Date.now() + backoffMs).toISOString();
+          const backoffMs = BACKOFF_MS[retryCount - 1] ?? 120_000;
+          const notBefore = new Date(Date.now() + backoffMs).toISOString();
           await admin.from('job_videos').update({
-            rewrite_status:           'queued',
-            rewrite_error:            message,
-            rewrite_retry_count:      retryCount,
-            rewrite_not_before:       notBefore,   // pump reads this
+            rewrite_status:      'queued',
+            rewrite_error:       message,
+            rewrite_retry_count: retryCount,
+            rewrite_not_before:  notBefore,
           }).eq('id', job_video_id);
           console.log(`[rewrite worker] 429 on ${job_video_id}: backoff ${backoffMs}ms until ${notBefore}`);
         }

@@ -61,9 +61,6 @@ const CANCELLABLE_STATUSES = [
   'awaiting_prompt', 'queued_for_rewrite', 'rewriting', 'building_export',
 ];
 
-// ALL non-terminal statuses — polling runs for every one of these.
-// Critically includes awaiting_prompt so polling survives the gap between
-// extraction finishing and the user submitting their rewrite prompt.
 const ACTIVE_STATUSES = new Set([
   'created', 'discovering', 'extracting',
   'awaiting_prompt',
@@ -215,16 +212,11 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
   const [hydrated, setHydrated] = useState(initialVideos.length > 0);
   const [modal,    setModal]    = useState<ModalState>('none');
 
-  // Refs — updated synchronously, never cause re-renders
   const jobRef          = useRef<Job>(initialJob);
   const videosRef       = useRef<JobVideo[]>(initialVideos);
   const statusRef       = useRef<string>(initialJob.status as string);
   const pumpRunning     = useRef<Record<string, boolean>>({});
   const completionShown = useRef<boolean>(false);
-
-  // pollTrigger: incrementing this number restarts the polling loop.
-  // We call setPollTrigger after handleSubmitPrompt so polling resumes
-  // for the rewriting → building_export → completed leg.
   const [pollTrigger, setPollTrigger] = useState(0);
 
   const [submittingPrompt, setSubmittingPrompt] = useState(false);
@@ -266,7 +258,28 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
     }
   }, []);
 
+  // ── syncStatusFromDB ──────────────────────────────────────────────────────
+  // Authoritative DB read — used by the pump whenever it needs to verify the
+  // real job status (e.g. after a silent break or fetch timeout).
+  const syncStatusFromDB = useCallback(async (): Promise<string> => {
+    try {
+      const supabase = createClient();
+      const { data } = await supabase.from('jobs').select('*').eq('id', jobId).single();
+      if (data) {
+        const changed = applyJobUpdate(data as Job);
+        if (changed) maybeShowCompletionModal(data.status as string);
+        return data.status as string;
+      }
+    } catch { /* ignore */ }
+    return statusRef.current;
+  }, [jobId, applyJobUpdate, maybeShowCompletionModal]);
+
   // ── pump ──────────────────────────────────────────────────────────────────
+  // CRITICAL check order:
+  //   1. advanced   → status advanced, update + show modal, break
+  //   2. waiting    → workers still in flight, sleep + retry
+  //   3. remaining  → genuinely nothing left; sync DB before breaking
+  //                   (guards against fetch timeouts that dropped advanced:true)
   const pump = useCallback(async (endpoint: string) => {
     if (pumpRunning.current[endpoint]) return;
     pumpRunning.current[endpoint] = true;
@@ -277,35 +290,60 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
         if (endpoint.includes('extract') && s !== 'extracting') break;
         if (endpoint.includes('rewrite') && !['rewriting', 'queued_for_rewrite'].includes(s)) break;
 
-        let resp: { success: boolean; data?: { remaining?: number; advanced?: boolean; next_status?: string; waiting?: boolean } };
+        let resp: { success: boolean; data?: { remaining?: number; advanced?: boolean; next_status?: string; waiting?: boolean } } | null = null;
         try {
-          const res = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ job_id: jobId }) });
+          const res = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ job_id: jobId }),
+          });
           if (!res.ok) { await sleep(5000); continue; }
           resp = await res.json();
-        } catch { await sleep(5000); continue; }
+        } catch {
+          // fetch timed out or network error — sync DB to catch any status
+          // advance that happened server-side before the timeout
+          await syncStatusFromDB();
+          await sleep(3000);
+          continue;
+        }
 
+        // ── 1. Job advanced to next status ──────────────────────────────────
         if (resp?.data?.advanced) {
           const next = resp.data.next_status;
           if (next) {
             statusRef.current = next;
             setJob(prev => { const u = { ...prev, status: next }; jobRef.current = u; return u; });
             maybeShowCompletionModal(next);
+          } else {
+            // advanced but no next_status hint — read DB to be sure
+            await syncStatusFromDB();
           }
           break;
         }
-        if (resp?.data?.waiting)              { await sleep(3000); continue; }
-        if ((resp?.data?.remaining ?? 0) <= 0) break;
+
+        // ── 2. Workers still processing, nothing queued yet ──────────────────
+        if (resp?.data?.waiting) { await sleep(3000); continue; }
+
+        // ── 3. Nothing remaining — but verify DB before breaking ─────────────
+        // This is the critical guard: if a previous fetch timed out mid-flight
+        // the server may have already advanced the job. remaining==0 on the
+        // *next* call would silently break without ever showing the modal.
+        if ((resp?.data?.remaining ?? 1) <= 0) {
+          await syncStatusFromDB();
+          break;
+        }
+
         await sleep(2000);
       }
     } finally {
       pumpRunning.current[endpoint] = false;
     }
-  }, [jobId, maybeShowCompletionModal]);
+  }, [jobId, maybeShowCompletionModal, syncStatusFromDB]);
 
   // ── startPumpIfNeeded ─────────────────────────────────────────────────────
   const startPumpIfNeeded = useCallback((s: string) => {
-    if (s === 'extracting')                                     pump('/api/worker/pump/extract');
-    else if (s === 'rewriting' || s === 'queued_for_rewrite')   pump('/api/worker/pump/rewrite');
+    if (s === 'extracting')                                   pump('/api/worker/pump/extract');
+    else if (s === 'rewriting' || s === 'queued_for_rewrite') pump('/api/worker/pump/rewrite');
   }, [pump]);
 
   // ── Mount: fresh DB fetch ─────────────────────────────────────────────────
@@ -348,8 +386,6 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
   }, [jobId]);
 
   // ── Polling fallback ──────────────────────────────────────────────────────
-  // Runs whenever pollTrigger changes (mount + after prompt submit).
-  // Polls every 3 s while ACTIVE_STATUSES — catches anything Realtime misses.
   useEffect(() => {
     let active  = true;
     let timerId: ReturnType<typeof setTimeout>;
@@ -357,7 +393,7 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
 
     async function poll() {
       if (!active) return;
-      if (!ACTIVE_STATUSES.has(statusRef.current)) return; // terminal — stop
+      if (!ACTIVE_STATUSES.has(statusRef.current)) return;
       try {
         const { data } = await supabase.from('jobs').select('*').eq('id', jobId).single();
         if (!active || !data) return;
@@ -366,18 +402,17 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
           maybeShowCompletionModal(data.status as string);
           startPumpIfNeeded(data.status as string);
         }
-      } catch { /* ignore network errors */ }
+      } catch { /* ignore */ }
       if (!active) return;
       if (ACTIVE_STATUSES.has(statusRef.current)) timerId = setTimeout(poll, 3000);
     }
 
     if (ACTIVE_STATUSES.has(statusRef.current)) timerId = setTimeout(poll, 3000);
     return () => { active = false; clearTimeout(timerId); };
-  // pollTrigger is intentional — re-runs this effect to restart polling
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobId, pollTrigger]);
 
-  // ── Boot pumps + modal for jobs already in progress on page load ──────────
+  // ── Boot pumps + modal on page load ──────────────────────────────────────
   useEffect(() => {
     startPumpIfNeeded(initialJob.status as string);
     maybeShowCompletionModal(initialJob.status as string);
@@ -394,12 +429,9 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
       if (!data.success) throw new Error((data.error as string) ?? 'Unknown error');
       toast.success(`Queued ${data.data.queued_count as number} video${(data.data.queued_count as number) !== 1 ? 's' : ''} for rewriting`);
       setModal('none');
-      // Update status immediately so UI reflects change without waiting for Realtime
       statusRef.current = 'queued_for_rewrite';
       setJob(prev => { const u = { ...prev, status: 'queued_for_rewrite' }; jobRef.current = u; return u; });
-      // Start rewrite pump immediately
       pump('/api/worker/pump/rewrite');
-      // Restart polling so it covers queued_for_rewrite → rewriting → building_export → completed
       setPollTrigger(t => t + 1);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Failed to submit prompt');

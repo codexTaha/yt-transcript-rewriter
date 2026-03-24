@@ -5,7 +5,7 @@ import type { ApiResponse } from '@/types';
 
 /**
  * GET /api/jobs/[id]/export-transcripts
- * Streams back a single .txt file with all transcripts bundled,
+ * Streams back a single .txt file with all raw transcripts bundled,
  * separated by video title headings and dividers.
  */
 export async function GET(
@@ -14,7 +14,6 @@ export async function GET(
 ) {
   const { id } = await params;
 
-  // Auth
   const supabase = await createClient();
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) {
@@ -23,7 +22,6 @@ export async function GET(
 
   const admin = createAdminClient();
 
-  // Ownership check
   const { data: job } = await admin
     .from('jobs')
     .select('id, user_id, source_name, source_url')
@@ -34,7 +32,6 @@ export async function GET(
     return NextResponse.json<ApiResponse>({ success: false, error: 'Not found' }, { status: 404 });
   }
 
-  // Fetch all videos that have a transcript
   const { data: videos } = await admin
     .from('job_videos')
     .select('video_id, video_title, transcript_storage_path, transcript_word_count')
@@ -43,14 +40,16 @@ export async function GET(
     .order('discovery_position', { ascending: true });
 
   if (!videos || videos.length === 0) {
-    return NextResponse.json<ApiResponse>({ success: false, error: 'No transcripts available' }, { status: 422 });
+    return NextResponse.json<ApiResponse>(
+      { success: false, error: 'No transcripts available to export' },
+      { status: 422 }
+    );
   }
 
-  // Build the .txt bundle
   const lines: string[] = [
-    `YT Rewriter — Transcript Export`,
-    `Source : ${job.source_name ?? job.source_url}`,
-    `URL    : ${job.source_url}`,
+    `YT Rewriter — Raw Transcript Export`,
+    `Source : ${(job.source_name as string | null) ?? (job.source_url as string)}`,
+    `URL    : ${job.source_url as string}`,
     `Videos : ${videos.length}`,
     `Date   : ${new Date().toUTCString()}`,
     '',
@@ -59,37 +58,49 @@ export async function GET(
   ];
 
   for (let i = 0; i < videos.length; i++) {
-    const v = videos[i];
-    const title   = (v.video_title as string | null) ?? (v.video_id as string);
-    const wordCnt = v.transcript_word_count ? ` (${(v.transcript_word_count as number).toLocaleString()} words)` : '';
+    const v     = videos[i];
+    const title = (v.video_title as string | null) ?? (v.video_id as string);
+    const words = v.transcript_word_count
+      ? ` (${(v.transcript_word_count as number).toLocaleString()} words)`
+      : '';
 
-    lines.push(`[${i + 1}] ${title}${wordCnt}`);
-    lines.push(`    https://www.youtube.com/watch?v=${v.video_id as string}`);
-    lines.push('');
+    lines.push(
+      `[${i + 1}] ${title}${words}`,
+      `    https://www.youtube.com/watch?v=${v.video_id as string}`,
+      ''
+    );
 
-    // Fetch transcript text from storage
-    const rawPath = (v.transcript_storage_path as string).replace(/^transcripts\//, '');
-    const { data: fileData } = await admin
+    // transcript_storage_path = "transcripts/{job_id}/{video_id}/transcript.txt"
+    // storage.from('transcripts').download() needs path WITHOUT "transcripts/" prefix
+    const storagePath = v.transcript_storage_path as string;
+    const downloadPath = storagePath.startsWith('transcripts/')
+      ? storagePath.slice('transcripts/'.length)
+      : storagePath;
+
+    const { data: fileData, error: dlErr } = await admin
       .storage
       .from('transcripts')
-      .download(rawPath);
+      .download(downloadPath);
 
-    const text = fileData ? await fileData.text() : '(transcript unavailable)';
-    lines.push(text.trim());
-    lines.push('');
-    lines.push('-'.repeat(80));
-    lines.push('');
+    if (dlErr || !fileData) {
+      lines.push('(transcript content unavailable)');
+    } else {
+      const text = await fileData.text();
+      lines.push(text.trim());
+    }
+
+    lines.push('', '-'.repeat(80), '');
   }
 
-  const bundle = lines.join('\n');
+  const bundle   = lines.join('\n');
   const filename = `transcripts-${id.slice(0, 8)}.txt`;
 
   return new NextResponse(bundle, {
     status: 200,
     headers: {
-      'Content-Type': 'text/plain; charset=utf-8',
+      'Content-Type':        'text/plain; charset=utf-8',
       'Content-Disposition': `attachment; filename="${filename}"`,
-      'Content-Length': String(Buffer.byteLength(bundle, 'utf8')),
+      'Content-Length':      String(Buffer.byteLength(bundle, 'utf8')),
     },
   });
 }

@@ -1,10 +1,16 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/admin';
-import { createClient } from '@/lib/supabase/server';
 import type { ApiResponse } from '@/types';
 
+/**
+ * POST /api/jobs/[id]/export
+ * Assembles the final Markdown bundle from all rewritten transcripts
+ * and stores it in the exports bucket.
+ *
+ * Called automatically by the rewrite pump when all videos are done.
+ */
 export async function POST(
-  req: NextRequest,
+  _req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
@@ -21,59 +27,98 @@ export async function POST(
       return NextResponse.json<ApiResponse>({ success: false, error: 'Job not found' }, { status: 404 });
     }
 
-    // Get all successfully rewritten videos
-    const { data: videos } = await admin
+    // Fetch ALL videos (done + failed) for complete bundle with failure notices
+    const { data: allVideos } = await admin
       .from('job_videos')
       .select('*')
       .eq('job_id', id)
-      .eq('rewrite_status', 'done')
       .order('discovery_position', { ascending: true });
 
-    if (!videos || videos.length === 0) {
+    const doneVideos   = (allVideos ?? []).filter(v => v.rewrite_status === 'done');
+    const failedVideos = (allVideos ?? []).filter(v => v.rewrite_status === 'failed');
+
+    if (doneVideos.length === 0) {
       await admin.from('jobs').update({
         status: 'failed',
-        error_message: 'No successfully rewritten videos to export'
+        error_message: 'No successfully rewritten videos to export',
       }).eq('id', id);
       return NextResponse.json<ApiResponse>({ success: false, error: 'Nothing to export' }, { status: 422 });
     }
 
-    // Build markdown bundle
-    const sections: string[] = [
-      `# Export: ${job.source_name ?? 'YouTube Job'}`,
+    // ── Build Markdown bundle ──────────────────────────────────────────────
+    const lines: string[] = [
+      `# ${job.source_name ?? 'YouTube Transcript Bundle'}`,
+      '',
       `**Source:** ${job.source_url}`,
       `**Prompt:** ${job.master_prompt}`,
-      `**Generated:** ${new Date().toISOString()}`,
-      `**Videos:** ${videos.length}`,
+      `**Generated:** ${new Date().toUTCString()}`,
+      `**Rewritten:** ${doneVideos.length} / ${(allVideos ?? []).length} videos`,
       '',
       '---',
       '',
+      '## Table of Contents',
+      '',
     ];
 
-    for (const video of videos) {
-      // Download rewritten content from storage
-      const path = video.rewritten_storage_path?.replace('rewrites/', '') ?? '';
+    // TOC
+    for (let i = 0; i < doneVideos.length; i++) {
+      const v = doneVideos[i];
+      const title  = (v.video_title as string | null) ?? (v.video_id as string);
+      const anchor = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+      lines.push(`${i + 1}. [${title}](#${anchor})`);
+    }
+
+    if (failedVideos.length > 0) {
+      lines.push('', `*${failedVideos.length} video(s) failed rewriting — listed at the end.*`);
+    }
+
+    lines.push('', '---', '');
+
+    // Content sections
+    for (const video of doneVideos) {
+      const title = (video.video_title as string | null) ?? (video.video_id as string);
+
+      // rewritten_storage_path = "transcripts/{job_id}/{video_id}/rewritten.txt"
+      // storage.from('transcripts').download() needs path WITHOUT bucket prefix
+      const rewrittenPath = (video.rewritten_storage_path as string)
+        .replace(/^transcripts\//, '');
+
       const { data: fileData } = await admin
         .storage
-        .from('rewrites')
-        .download(path);
+        .from('transcripts')
+        .download(rewrittenPath);
 
-      const content = fileData ? await fileData.text() : '*(content unavailable)*';
+      const content = fileData ? await fileData.text() : '*(rewritten content unavailable)*';
 
-      sections.push(
-        `## ${video.video_title ?? video.video_id}`,
-        `**URL:** https://www.youtube.com/watch?v=${video.video_id}`,
+      lines.push(
+        `## ${title}`,
         '',
-        content,
+        `**URL:** https://www.youtube.com/watch?v=${video.video_id as string}`,
+        '',
+        content.trim(),
         '',
         '---',
         ''
       );
     }
 
-    const markdownBundle = sections.join('\n');
-    const storagePath = `${id}/export.md`;
+    // Failed section at end
+    if (failedVideos.length > 0) {
+      lines.push('## ⚠️ Failed Videos', '');
+      for (const video of failedVideos) {
+        const title = (video.video_title as string | null) ?? (video.video_id as string);
+        lines.push(
+          `### ${title}`,
+          `**URL:** https://www.youtube.com/watch?v=${video.video_id as string}`,
+          `**Error:** ${(video.rewrite_error as string | null) ?? 'Unknown error'}`,
+          ''
+        );
+      }
+    }
 
-    // Upload to exports bucket
+    const markdownBundle = lines.join('\n');
+    const storagePath    = `${id}/export.md`;
+
     const { error: uploadError } = await admin
       .storage
       .from('exports')
@@ -84,34 +129,45 @@ export async function POST(
 
     if (uploadError) throw new Error(`Export upload failed: ${uploadError.message}`);
 
-    // Record export + mark job complete
-    await admin.from('exports').insert({
-      job_id: id,
-      storage_path: `exports/${storagePath}`,
-      file_size_bytes: markdownBundle.length,
-      video_count: videos.length,
-      success_count: videos.length,
-      failed_count: 0,
-      bundle_format: 'markdown',
-    });
+    // Record in exports table
+    await admin.from('exports').upsert({
+      job_id:          id,
+      storage_path:    `exports/${storagePath}`,
+      file_size_bytes: Buffer.byteLength(markdownBundle, 'utf8'),
+      video_count:     (allVideos ?? []).length,
+      success_count:   doneVideos.length,
+      failed_count:    failedVideos.length,
+      bundle_format:   'markdown',
+    }, { onConflict: 'job_id' });
 
-    const finalStatus = (job.rewrite_failed_count ?? 0) > 0 ? 'completed_with_errors' : 'completed';
+    const finalStatus = failedVideos.length > 0 ? 'completed_with_errors' : 'completed';
 
     await admin.from('jobs').update({
-      status: finalStatus,
+      status:             finalStatus,
       export_storage_path: `exports/${storagePath}`,
-      export_ready: true,
-      completed_at: new Date().toISOString(),
+      export_ready:       true,
+      completed_at:       new Date().toISOString(),
+      rewrite_success_count: doneVideos.length,
+      rewrite_failed_count:  failedVideos.length,
     }).eq('id', id);
 
     return NextResponse.json<ApiResponse>({
       success: true,
-      data: { storage_path: `exports/${storagePath}`, video_count: videos.length }
+      data: {
+        storage_path:  `exports/${storagePath}`,
+        video_count:   doneVideos.length,
+        failed_count:  failedVideos.length,
+        final_status:  finalStatus,
+      },
     });
 
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Export failed';
-    await admin.from('jobs').update({ status: 'failed', error_message: message }).eq('id', id).catch(() => {});
+    console.error('[export] fatal:', message);
+    await admin.from('jobs').update({
+      status: 'failed',
+      error_message: message,
+    }).eq('id', id).catch(() => {});
     return NextResponse.json<ApiResponse>({ success: false, error: message }, { status: 500 });
   }
 }

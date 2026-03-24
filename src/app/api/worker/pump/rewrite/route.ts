@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import type { ApiResponse } from '@/types';
 
-const BATCH_SIZE = 2; // Reduced from 3 to stay under rate limits
+const BATCH_SIZE = 3;
 const MAX_RETRIES = 3;
 
 export async function POST(req: NextRequest) {
@@ -130,9 +130,9 @@ export async function POST(req: NextRequest) {
     await admin
       .from('job_videos')
       .update({
-        rewrite_status:      'processing',
+        rewrite_status:       'processing',
         rewrite_attempted_at: new Date().toISOString(),
-        rewrite_not_before:  null, // clear backoff
+        rewrite_not_before:   null, // clear backoff
       })
       .in('id', batch.map((v: { id: string }) => v.id));
 

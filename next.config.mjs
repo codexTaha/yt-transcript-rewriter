@@ -1,7 +1,6 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  serverExternalPackages: ['youtubei.js'],
-  experimental: {}
+  // No special server packages needed — transcript fetching is now via Python child process
 };
 
 export default nextConfig;

@@ -61,18 +61,11 @@ const CANCELLABLE_STATUSES = [
   'awaiting_prompt', 'queued_for_rewrite', 'rewriting', 'building_export',
 ];
 
-// Every status that is NOT terminal — heartbeat runs while any of these is current.
 const ACTIVE_STATUSES = new Set([
   'created', 'discovering', 'extracting',
   'awaiting_prompt',
   'queued_for_rewrite', 'rewriting', 'building_export',
 ]);
-
-const TERMINAL_STATUSES = new Set(['completed', 'completed_with_errors', 'failed', 'cancelled']);
-
-// Pump drives workers but NEVER owns status transitions — DB is the only truth.
-const PUMP_INTERVAL_MS  = 2000;   // how often the pump calls the worker endpoint
-const HEARTBEAT_MS      = 2000;   // how often we read DB while job is active
 
 // ─── Transcript Viewer Modal ──────────────────────────────────────────────────
 
@@ -209,240 +202,244 @@ function RewritePromptModal({ transcriptCount, onSubmit, onBack, submitting }: {
 
 type ModalState = 'none' | 'completion' | 'prompt';
 
+function sleep(ms: number) { return new Promise<void>(r => setTimeout(r, ms)); }
+
 export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; initialVideos: JobVideo[] }) {
   const router = useRouter();
 
-  // ── Pure React state — DB is the ONLY source of truth for job/status ──────
   const [job,      setJob]      = useState<Job>(initialJob);
   const [videos,   setVideos]   = useState<JobVideo[]>(initialVideos);
   const [hydrated, setHydrated] = useState(initialVideos.length > 0);
   const [modal,    setModal]    = useState<ModalState>('none');
 
-  // Stable refs used inside callbacks/intervals — never drive render directly
-  const jobRef           = useRef<Job>(initialJob);
-  const videosRef        = useRef<JobVideo[]>(initialVideos);
-  const completionShown  = useRef<boolean>(false);
-  const pumpRunning      = useRef<Record<string, boolean>>({});
-  const heartbeatLock    = useRef<boolean>(false);   // prevent overlapping DB reads
+  const jobRef          = useRef<Job>(initialJob);
+  const videosRef       = useRef<JobVideo[]>(initialVideos);
+  const statusRef       = useRef<string>(initialJob.status as string);
+  const pumpRunning     = useRef<Record<string, boolean>>({});
+  const completionShown = useRef<boolean>(false);
+  const [pollTrigger, setPollTrigger] = useState(0);
+
+  const [submittingPrompt, setSubmittingPrompt] = useState(false);
+  const [downloading,      setDownloading]      = useState(false);
+  const [exportingRaw,     setExportingRaw]     = useState(false);
+  const [cancelling,       setCancelling]       = useState(false);
+  const [deleting,         setDeleting]         = useState(false);
+  const [viewingVideo,     setViewingVideo]     = useState<JobVideo | null>(null);
 
   const jobId = initialJob.id as string;
 
-  // ── Central status handler — called by EVERY path that learns of a new status
-  // (heartbeat, Realtime, pump response, action handlers).
-  // This is the single place that decides whether to show the completion modal.
-  const handleStatusChange = useCallback((newJob: Job) => {
-    const prev   = jobRef.current.status as string;
-    const next   = newJob.status         as string;
-    jobRef.current = newJob;
-    setJob(newJob);
+  // ── applyJobUpdate ────────────────────────────────────────────────────────
+  const applyJobUpdate = useCallback((incoming: Job): boolean => {
+    const oldStatus = jobRef.current.status as string;
+    const newStatus = incoming.status       as string;
+    jobRef.current  = incoming;
+    setJob(incoming);
+    if (newStatus !== oldStatus) { statusRef.current = newStatus; return true; }
+    return false;
+  }, []);
 
-    if (next === prev) return; // no-op if same
+  // ── applyVideoUpdate ──────────────────────────────────────────────────────
+  const applyVideoUpdate = useCallback((incoming: JobVideo) => {
+    setVideos(prev => {
+      const next = prev.some(v => (v.id as string) === (incoming.id as string))
+        ? prev.map(v => (v.id as string) === (incoming.id as string) ? incoming : v)
+        : [...prev, incoming];
+      videosRef.current = next;
+      return next;
+    });
+    setHydrated(true);
+  }, []);
 
-    // Show completion modal exactly once when extraction finishes
-    if (next === 'awaiting_prompt' && !completionShown.current) {
+  // ── maybeShowCompletionModal ──────────────────────────────────────────────
+  const maybeShowCompletionModal = useCallback((s: string) => {
+    if (s === 'awaiting_prompt' && !completionShown.current) {
       completionShown.current = true;
       setModal('completion');
     }
   }, []);
 
-  // ── Read full job + videos from DB and apply ───────────────────────────────
-  const syncFromDB = useCallback(async () => {
-    if (heartbeatLock.current) return;
-    heartbeatLock.current = true;
+  // ── syncStatusFromDB ──────────────────────────────────────────────────────
+  // Authoritative DB read — used by the pump whenever it needs to verify the
+  // real job status (e.g. after a silent break or fetch timeout).
+  const syncStatusFromDB = useCallback(async (): Promise<string> => {
     try {
       const supabase = createClient();
-      const [{ data: jobData }, { data: videoData }] = await Promise.all([
-        supabase.from('jobs').select('*').eq('id', jobId).single(),
-        supabase.from('job_videos').select('*').eq('job_id', jobId).order('discovery_position', { ascending: true }),
-      ]);
-      if (jobData)   handleStatusChange(jobData as Job);
-      if (videoData) {
-        videosRef.current = videoData as JobVideo[];
-        setVideos(videoData as JobVideo[]);
-        setHydrated(true);
+      const { data } = await supabase.from('jobs').select('*').eq('id', jobId).single();
+      if (data) {
+        const changed = applyJobUpdate(data as Job);
+        if (changed) maybeShowCompletionModal(data.status as string);
+        return data.status as string;
       }
-    } catch { /* ignore transient errors — next tick will retry */ }
-    finally { heartbeatLock.current = false; }
-  }, [jobId, handleStatusChange]);
+    } catch { /* ignore */ }
+    return statusRef.current;
+  }, [jobId, applyJobUpdate, maybeShowCompletionModal]);
 
-  // ── Heartbeat: polls DB every HEARTBEAT_MS while job is active ────────────
-  // This is the guaranteed safety net. It runs unconditionally — no stale refs,
-  // no pump state, no Realtime dependency. Tab visibility triggers immediate poll.
-  useEffect(() => {
-    // Immediately sync on mount to fix SSR staleness
-    syncFromDB();
-
-    const iv = setInterval(() => {
-      const s = jobRef.current.status as string;
-      if (TERMINAL_STATUSES.has(s)) {
-        clearInterval(iv);
-        return;
-      }
-      syncFromDB();
-    }, HEARTBEAT_MS);
-
-    // When tab becomes visible again, poll immediately
-    const onVisible = () => {
-      if (!TERMINAL_STATUSES.has(jobRef.current.status as string)) syncFromDB();
-    };
-    document.addEventListener('visibilitychange', onVisible);
-
-    return () => {
-      clearInterval(iv);
-      document.removeEventListener('visibilitychange', onVisible);
-    };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jobId]);
-
-  // ── Realtime: bonus fast path on top of heartbeat ─────────────────────────
-  // If Realtime fires we get near-instant updates. If it drops, heartbeat catches it.
-  useEffect(() => {
-    const supabase = createClient();
-    const ch = supabase
-      .channel(`job-detail-rt-${jobId}`)
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'jobs', filter: `id=eq.${jobId}` },
-        payload => handleStatusChange(payload.new as Job)
-      )
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'job_videos', filter: `job_id=eq.${jobId}` },
-        payload => {
-          setVideos(prev => {
-            const incoming = payload.new as JobVideo;
-            const next = prev.some(v => (v.id as string) === (incoming.id as string))
-              ? prev.map(v => (v.id as string) === (incoming.id as string) ? incoming : v)
-              : [...prev, incoming];
-            videosRef.current = next;
-            return next;
-          });
-          setHydrated(true);
-        }
-      )
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'job_videos', filter: `job_id=eq.${jobId}` },
-        payload => {
-          setVideos(prev => {
-            const incoming = payload.new as JobVideo;
-            const next = prev.some(v => (v.id as string) === (incoming.id as string))
-              ? prev.map(v => (v.id as string) === (incoming.id as string) ? incoming : v)
-              : [...prev, incoming];
-            videosRef.current = next;
-            return next;
-          });
-          setHydrated(true);
-        }
-      )
-      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'job_videos', filter: `job_id=eq.${jobId}` },
-        payload => {
-          setVideos(prev => {
-            const next = prev.filter(v => (v.id as string) !== (payload.old.id as string));
-            videosRef.current = next;
-            return next;
-          });
-        }
-      )
-      .subscribe();
-    return () => { supabase.removeChannel(ch); };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jobId]);
-
-  // ── Worker pump — drives server-side workers, does NOT own status ─────────
-  // It just keeps calling the worker endpoint while the job is in the right
-  // state. Status comes from the heartbeat/Realtime, not from pump responses.
-  const pump = useCallback(async (endpoint: string, validStatuses: string[]) => {
+  // ── pump ──────────────────────────────────────────────────────────────────
+  // CRITICAL check order:
+  //   1. advanced   → status advanced, update + show modal, break
+  //   2. waiting    → workers still in flight, sleep + retry
+  //   3. remaining  → genuinely nothing left; sync DB before breaking
+  //                   (guards against fetch timeouts that dropped advanced:true)
+  const pump = useCallback(async (endpoint: string) => {
     if (pumpRunning.current[endpoint]) return;
     pumpRunning.current[endpoint] = true;
     try {
       while (true) {
-        const s = jobRef.current.status as string;
-        if (!validStatuses.includes(s)) break; // heartbeat already moved us on
+        const s = statusRef.current;
+        if (s === 'cancelled' || s === 'failed') break;
+        if (endpoint.includes('extract') && s !== 'extracting') break;
+        if (endpoint.includes('rewrite') && !['rewriting', 'queued_for_rewrite'].includes(s)) break;
 
+        let resp: { success: boolean; data?: { remaining?: number; advanced?: boolean; next_status?: string; waiting?: boolean } } | null = null;
         try {
           const res = await fetch(endpoint, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ job_id: jobId }),
           });
-          if (!res.ok) { await new Promise(r => setTimeout(r, 5000)); continue; }
-          const resp = await res.json() as { data?: { remaining?: number; waiting?: boolean; advanced?: boolean } };
-
-          // Worker says it has advanced the job — sync DB immediately
-          // (don't wait for the next heartbeat tick)
-          if (resp?.data?.advanced) {
-            await syncFromDB();
-            break;
-          }
-          if (resp?.data?.waiting)              { await new Promise(r => setTimeout(r, 3000)); continue; }
-          if ((resp?.data?.remaining ?? 0) <= 0) {
-            // Nothing left — sync DB to pick up any status advance,
-            // then exit pump (heartbeat will continue watching)
-            await syncFromDB();
-            break;
-          }
+          if (!res.ok) { await sleep(5000); continue; }
+          resp = await res.json();
         } catch {
-          // Network/timeout — sync DB immediately in case server already advanced
-          await syncFromDB();
-          await new Promise(r => setTimeout(r, 3000));
+          // fetch timed out or network error — sync DB to catch any status
+          // advance that happened server-side before the timeout
+          await syncStatusFromDB();
+          await sleep(3000);
           continue;
         }
 
-        await new Promise(r => setTimeout(r, PUMP_INTERVAL_MS));
+        // ── 1. Job advanced to next status ──────────────────────────────────
+        if (resp?.data?.advanced) {
+          const next = resp.data.next_status;
+          if (next) {
+            statusRef.current = next;
+            setJob(prev => { const u = { ...prev, status: next }; jobRef.current = u; return u; });
+            maybeShowCompletionModal(next);
+          } else {
+            // advanced but no next_status hint — read DB to be sure
+            await syncStatusFromDB();
+          }
+          break;
+        }
+
+        // ── 2. Workers still processing, nothing queued yet ──────────────────
+        if (resp?.data?.waiting) { await sleep(3000); continue; }
+
+        // ── 3. Nothing remaining — but verify DB before breaking ─────────────
+        // This is the critical guard: if a previous fetch timed out mid-flight
+        // the server may have already advanced the job. remaining==0 on the
+        // *next* call would silently break without ever showing the modal.
+        if ((resp?.data?.remaining ?? 1) <= 0) {
+          await syncStatusFromDB();
+          break;
+        }
+
+        await sleep(2000);
       }
     } finally {
       pumpRunning.current[endpoint] = false;
     }
-  }, [jobId, syncFromDB]);
+  }, [jobId, maybeShowCompletionModal, syncStatusFromDB]);
 
-  // ── Start pumps when status needs it ──────────────────────────────────────
-  const startPumpsForStatus = useCallback((s: string) => {
-    if (s === 'extracting')
-      pump('/api/worker/pump/extract', ['extracting']);
-    else if (s === 'queued_for_rewrite' || s === 'rewriting')
-      pump('/api/worker/pump/rewrite', ['queued_for_rewrite', 'rewriting']);
+  // ── startPumpIfNeeded ─────────────────────────────────────────────────────
+  const startPumpIfNeeded = useCallback((s: string) => {
+    if (s === 'extracting')                                   pump('/api/worker/pump/extract');
+    else if (s === 'rewriting' || s === 'queued_for_rewrite') pump('/api/worker/pump/rewrite');
   }, [pump]);
 
-  // Boot pumps on mount for jobs already in progress
+  // ── Mount: fresh DB fetch ─────────────────────────────────────────────────
   useEffect(() => {
-    startPumpsForStatus(initialJob.status as string);
+    let active = true;
+    const supabase = createClient();
+    supabase.from('jobs').select('*').eq('id', jobId).single().then(({ data }) => {
+      if (!active || !data) return;
+      applyJobUpdate(data as Job);
+      maybeShowCompletionModal(data.status as string);
+      startPumpIfNeeded(data.status as string);
+    });
+    supabase.from('job_videos').select('*').eq('job_id', jobId).order('discovery_position', { ascending: true }).then(({ data }) => {
+      if (!active || !data) return;
+      videosRef.current = data as JobVideo[];
+      setVideos(data as JobVideo[]);
+      setHydrated(true);
+    });
+    return () => { active = false; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobId]);
+
+  // ── Realtime ──────────────────────────────────────────────────────────────
+  useEffect(() => {
+    const supabase = createClient();
+    const ch = supabase.channel(`job-detail-${jobId}`)
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'jobs', filter: `id=eq.${jobId}` }, payload => {
+        const updated = payload.new as Job;
+        const changed = applyJobUpdate(updated);
+        if (changed) { maybeShowCompletionModal(updated.status as string); startPumpIfNeeded(updated.status as string); }
+      })
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'job_videos', filter: `job_id=eq.${jobId}` }, payload => applyVideoUpdate(payload.new as JobVideo))
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'job_videos', filter: `job_id=eq.${jobId}` }, payload => applyVideoUpdate(payload.new as JobVideo))
+      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'job_videos', filter: `job_id=eq.${jobId}` }, payload => {
+        setVideos(prev => { const next = prev.filter(v => (v.id as string) !== (payload.old.id as string)); videosRef.current = next; return next; });
+      })
+      .subscribe();
+    return () => { supabase.removeChannel(ch); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobId]);
+
+  // ── Polling fallback ──────────────────────────────────────────────────────
+  useEffect(() => {
+    let active  = true;
+    let timerId: ReturnType<typeof setTimeout>;
+    const supabase = createClient();
+
+    async function poll() {
+      if (!active) return;
+      if (!ACTIVE_STATUSES.has(statusRef.current)) return;
+      try {
+        const { data } = await supabase.from('jobs').select('*').eq('id', jobId).single();
+        if (!active || !data) return;
+        const changed = applyJobUpdate(data as Job);
+        if (changed) {
+          maybeShowCompletionModal(data.status as string);
+          startPumpIfNeeded(data.status as string);
+        }
+      } catch { /* ignore */ }
+      if (!active) return;
+      if (ACTIVE_STATUSES.has(statusRef.current)) timerId = setTimeout(poll, 3000);
+    }
+
+    if (ACTIVE_STATUSES.has(statusRef.current)) timerId = setTimeout(poll, 3000);
+    return () => { active = false; clearTimeout(timerId); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobId, pollTrigger]);
+
+  // ── Boot pumps + modal on page load ──────────────────────────────────────
+  useEffect(() => {
+    startPumpIfNeeded(initialJob.status as string);
+    maybeShowCompletionModal(initialJob.status as string);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  // Also start pump whenever Realtime or heartbeat surfaces a new active status
-  const prevStatusRef = useRef<string>(initialJob.status as string);
-  useEffect(() => {
-    const s = job.status as string;
-    if (s !== prevStatusRef.current) {
-      prevStatusRef.current = s;
-      startPumpsForStatus(s);
-    }
-  }, [job.status, startPumpsForStatus]);
 
   // ── Action handlers ───────────────────────────────────────────────────────
 
   const handleSubmitPrompt = async (promptText: string) => {
+    setSubmittingPrompt(true);
     try {
-      const res  = await fetch(`/api/jobs/${jobId}/prompt`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ master_prompt: promptText }),
-      });
+      const res  = await fetch(`/api/jobs/${jobId}/prompt`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ master_prompt: promptText }) });
       const data = await res.json();
       if (!data.success) throw new Error((data.error as string) ?? 'Unknown error');
       toast.success(`Queued ${data.data.queued_count as number} video${(data.data.queued_count as number) !== 1 ? 's' : ''} for rewriting`);
       setModal('none');
-      // Immediately sync DB — don't wait for next heartbeat tick
-      await syncFromDB();
-      pump('/api/worker/pump/rewrite', ['queued_for_rewrite', 'rewriting']);
+      statusRef.current = 'queued_for_rewrite';
+      setJob(prev => { const u = { ...prev, status: 'queued_for_rewrite' }; jobRef.current = u; return u; });
+      pump('/api/worker/pump/rewrite');
+      setPollTrigger(t => t + 1);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Failed to submit prompt');
+    } finally {
+      setSubmittingPrompt(false);
     }
   };
 
-  const [submittingPrompt, setSubmittingPrompt] = useState(false);
-  const wrappedSubmitPrompt = async (p: string) => {
-    setSubmittingPrompt(true);
-    await handleSubmitPrompt(p);
-    setSubmittingPrompt(false);
-  };
-
-  const [exportingRaw, setExportingRaw] = useState(false);
   const handleExportRaw = async () => {
     if (exportingRaw) return;
     setExportingRaw(true); setModal('none');
@@ -459,7 +456,6 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
     finally { setExportingRaw(false); }
   };
 
-  const [downloading, setDownloading] = useState(false);
   const handleDownloadRewritten = async () => {
     setDownloading(true);
     try {
@@ -471,7 +467,6 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
     finally { setDownloading(false); }
   };
 
-  const [cancelling, setCancelling] = useState(false);
   const handleCancel = async () => {
     if (!confirm('Cancel this job? This cannot be undone.')) return;
     setCancelling(true);
@@ -480,13 +475,13 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
       const data = await res.json();
       if (!data.success) throw new Error((data.error as string) ?? 'Unknown error');
       toast.success('Job cancelled');
+      statusRef.current = 'cancelled';
+      setJob(prev => { const u = { ...prev, status: 'cancelled' }; jobRef.current = u; return u; });
       setModal('none');
-      await syncFromDB();
     } catch (err) { toast.error(err instanceof Error ? err.message : 'Failed to cancel'); }
     finally { setCancelling(false); }
   };
 
-  const [deleting, setDeleting] = useState(false);
   const handleDelete = async () => {
     if (!confirm('Permanently delete this job and ALL its data? This cannot be undone.')) return;
     setDeleting(true);
@@ -497,8 +492,6 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
       toast.success('Job deleted'); router.push('/dashboard');
     } catch (err) { toast.error(err instanceof Error ? err.message : 'Failed to delete'); setDeleting(false); }
   };
-
-  const [viewingVideo, setViewingVideo] = useState<JobVideo | null>(null);
 
   // ── Derived values ────────────────────────────────────────────────────────
   const status         = job.status as string;
@@ -526,7 +519,7 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
       {modal === 'prompt' && (
         <RewritePromptModal
           transcriptCount={transcriptDone}
-          onSubmit={wrappedSubmitPrompt}
+          onSubmit={handleSubmitPrompt}
           onBack={() => setModal('completion')}
           submitting={submittingPrompt}
         />
@@ -551,10 +544,7 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
               </Badge>
 
               {status === 'awaiting_prompt' && modal === 'none' && transcriptDone > 0 && (
-                <Button variant="outline" size="sm" onClick={() => {
-                  completionShown.current = false;
-                  if (!completionShown.current) { completionShown.current = true; setModal('completion'); }
-                }}>
+                <Button variant="outline" size="sm" onClick={() => { completionShown.current = false; maybeShowCompletionModal('awaiting_prompt'); }}>
                   <Pencil className="h-3.5 w-3.5 mr-1.5" />What&apos;s next?
                 </Button>
               )}

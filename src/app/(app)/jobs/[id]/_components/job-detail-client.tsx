@@ -1,6 +1,7 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
+import { useRouter } from 'next/navigation';
 import { createClient } from '@/lib/supabase/client';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -21,6 +22,7 @@ const STATUS_LABELS: Record<string, string> = {
   completed: 'Completed',
   completed_with_errors: 'Completed',
   failed: 'Failed',
+  cancelled: 'Cancelled',
 };
 
 const STATUS_VARIANTS: Record<string, 'default' | 'secondary' | 'success' | 'warning' | 'destructive'> = {
@@ -34,6 +36,7 @@ const STATUS_VARIANTS: Record<string, 'default' | 'secondary' | 'success' | 'war
   completed: 'success',
   completed_with_errors: 'warning',
   failed: 'destructive',
+  cancelled: 'secondary',
 };
 
 const TRANSCRIPT_VARIANTS: Record<string, 'default' | 'secondary' | 'success' | 'warning' | 'destructive'> = {
@@ -52,6 +55,11 @@ const REWRITE_VARIANTS: Record<string, 'default' | 'secondary' | 'success' | 'wa
   failed: 'destructive',
 };
 
+const CANCELLABLE_STATUSES = [
+  'created', 'discovering', 'extracting',
+  'awaiting_prompt', 'queued_for_rewrite', 'rewriting', 'building_export',
+];
+
 export function JobDetailClient({
   job: initialJob,
   initialVideos,
@@ -59,14 +67,24 @@ export function JobDetailClient({
   job: Job;
   initialVideos: JobVideo[];
 }) {
+  const router = useRouter();
   const [job, setJob] = useState<Job>(initialJob);
   const [videos, setVideos] = useState<JobVideo[]>(initialVideos);
   const [prompt, setPrompt] = useState('');
   const [submittingPrompt, setSubmittingPrompt] = useState(false);
   const [downloading, setDownloading] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+
+  // Ref so the pump loop always sees the latest status without re-creating the effect
+  const statusRef = useRef<string>(initialJob.status as string);
 
   const jobId = job.id as string;
   const status = job.status as string;
+
+  // Keep statusRef in sync
+  useEffect(() => {
+    statusRef.current = status;
+  }, [status]);
 
   // Realtime: subscribe to job row changes
   useEffect(() => {
@@ -100,10 +118,17 @@ export function JobDetailClient({
     return () => { supabase.removeChannel(channel); };
   }, [jobId]);
 
-  // Pump loop: keep calling extract pump until done
+  // Pump loop — stops automatically when job is cancelled or status changes
   const pump = useCallback(async (endpoint: string) => {
     let remaining = 999;
     while (remaining > 0) {
+      // Stop if job was cancelled or moved away from the pumping status
+      if (
+        statusRef.current === 'cancelled' ||
+        (endpoint.includes('extract') && statusRef.current !== 'extracting') ||
+        (endpoint.includes('rewrite') && statusRef.current !== 'rewriting')
+      ) break;
+
       try {
         const res = await fetch(endpoint, {
           method: 'POST',
@@ -120,7 +145,7 @@ export function JobDetailClient({
     }
   }, [jobId]);
 
-  // Auto-start pump when status is extracting
+  // Auto-start pump when status is extracting/rewriting
   useEffect(() => {
     if (status === 'extracting') {
       pump('/api/worker/pump/extract');
@@ -162,9 +187,28 @@ export function JobDetailClient({
     }
   };
 
+  const handleCancel = async () => {
+    if (!confirm('Cancel this job? This cannot be undone.')) return;
+    setCancelling(true);
+    try {
+      const res = await fetch(`/api/jobs/${jobId}/cancel`, { method: 'POST' });
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error);
+      toast.success('Job cancelled');
+      // Optimistically update local state so the button disappears immediately
+      setJob(prev => ({ ...prev, status: 'cancelled' }));
+      router.refresh();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to cancel job');
+    } finally {
+      setCancelling(false);
+    }
+  };
+
   const transcriptDone = videos.filter(v => v.transcript_status === 'done').length;
   const rewriteDone = videos.filter(v => v.rewrite_status === 'done').length;
   const totalVideos = videos.length || (job.total_video_count as number) || 0;
+  const isCancellable = CANCELLABLE_STATUSES.includes(status);
 
   return (
     <div className="min-h-screen bg-background">
@@ -182,9 +226,22 @@ export function JobDetailClient({
             </h1>
             <p className="text-muted-foreground text-sm mt-1">{job.source_url as string}</p>
           </div>
-          <Badge variant={STATUS_VARIANTS[status] ?? 'secondary'}>
-            {STATUS_LABELS[status] ?? status}
-          </Badge>
+          <div className="flex items-center gap-3">
+            <Badge variant={STATUS_VARIANTS[status] ?? 'secondary'}>
+              {STATUS_LABELS[status] ?? status}
+            </Badge>
+            {isCancellable && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleCancel}
+                disabled={cancelling}
+                className="text-destructive border-destructive/40 hover:bg-destructive/10 hover:text-destructive"
+              >
+                {cancelling ? 'Cancelling...' : 'Cancel Job'}
+              </Button>
+            )}
+          </div>
         </div>
 
         {/* Stats */}
@@ -206,6 +263,16 @@ export function JobDetailClient({
             <div className="text-sm text-muted-foreground mt-1">Rewritten</div>
           </div>
         </div>
+
+        {/* Cancelled state */}
+        {status === 'cancelled' && (
+          <div className="bg-muted/40 border border-border rounded-lg p-5 mb-8">
+            <p className="font-medium text-foreground">Job cancelled</p>
+            <p className="text-sm text-muted-foreground mt-1">
+              This job was cancelled. {transcriptDone > 0 ? `${transcriptDone} transcript(s) were extracted before cancellation.` : 'No transcripts were extracted.'}
+            </p>
+          </div>
+        )}
 
         {/* Prompt box — shown when awaiting prompt */}
         {status === 'awaiting_prompt' && (
@@ -269,7 +336,13 @@ export function JobDetailClient({
                   </div>
                   <div className="flex items-center gap-2 shrink-0">
                     <Badge variant={TRANSCRIPT_VARIANTS[tStatus] ?? 'secondary'} className="text-xs">
-                      {tStatus === 'done' ? '✓ Transcript' : tStatus === 'failed' ? '✗ No transcript' : tStatus}
+                      {tStatus === 'done'
+                        ? '✓ Transcript'
+                        : tStatus === 'failed'
+                        ? '✗ No transcript'
+                        : tStatus === 'skipped'
+                        ? '— Skipped'
+                        : tStatus}
                     </Badge>
                     {rStatus !== 'not_started' && (
                       <Badge variant={REWRITE_VARIANTS[rStatus] ?? 'secondary'} className="text-xs">

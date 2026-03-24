@@ -3,6 +3,20 @@ import { createAdminClient } from '@/lib/supabase/admin';
 import { fetchTranscript } from '@/lib/transcript/fetchTranscript';
 import type { ApiResponse } from '@/types';
 
+// Error messages that mean the video is permanently gone — no point retrying
+const PERMANENT_ERROR_PATTERNS = [
+  'account associated with this video has been terminated',
+  'video has been removed',
+  'This video is unavailable',
+  'Transcripts are disabled',
+  'TranscriptsDisabled',
+  'This video is private',
+];
+
+function isPermanentError(msg: string): boolean {
+  return PERMANENT_ERROR_PATTERNS.some(p => msg.toLowerCase().includes(p.toLowerCase()));
+}
+
 export async function POST(req: NextRequest) {
   const admin = createAdminClient();
 
@@ -22,12 +36,22 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // Bail immediately if the job was cancelled
+    const { data: job } = await admin
+      .from('jobs')
+      .select('status')
+      .eq('id', job_id)
+      .single();
+
+    if (!job || job.status === 'cancelled') {
+      await admin.from('job_videos').update({ transcript_status: 'skipped' }).eq('id', job_video_id);
+      return NextResponse.json<ApiResponse>({ success: false, error: 'Job cancelled' }, { status: 409 });
+    }
+
     let transcriptText: string;
     let language = 'en';
 
     try {
-      // Uses youtube-transcript-api (Python) — same logic as roundyyy/yt-bulk-subtitles-downloader
-      // Tries: English -> translatable->English -> any language
       const result = await fetchTranscript(video_id);
       transcriptText = result.text;
       language = result.language;
@@ -43,7 +67,8 @@ export async function POST(req: NextRequest) {
         .single();
 
       const retryCount = (current?.transcript_retry_count ?? 0) + 1;
-      const newStatus = retryCount >= 3 ? 'failed' : 'pending';
+      // Permanently failed errors or exceeded retry limit → mark as failed immediately
+      const newStatus = isPermanentError(errMsg) || retryCount >= 3 ? 'failed' : 'pending';
 
       await admin
         .from('job_videos')

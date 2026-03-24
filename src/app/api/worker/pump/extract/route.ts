@@ -5,6 +5,23 @@ import type { ApiResponse } from '@/types';
 const BATCH_SIZE = 5;
 const MAX_RETRIES = 3;
 
+// Error substrings that mean the video is permanently unrecoverable.
+// No point retrying — mark as failed immediately.
+const PERMANENT_ERROR_PATTERNS = [
+  'account associated with this video has been terminated',
+  'video has been removed',
+  'This video is unavailable',
+  'Transcripts are disabled',
+  'TranscriptsDisabled',
+  'This video is private',
+];
+
+export function isPermanentError(errMsg: string): boolean {
+  return PERMANENT_ERROR_PATTERNS.some(p =>
+    errMsg.toLowerCase().includes(p.toLowerCase())
+  );
+}
+
 export async function POST(req: NextRequest) {
   const admin = createAdminClient();
 
@@ -16,14 +33,14 @@ export async function POST(req: NextRequest) {
       return NextResponse.json<ApiResponse>({ success: false, error: 'job_id is required' }, { status: 400 });
     }
 
-    // Get job to verify it's in extracting state
+    // Get job — stop immediately if cancelled or not in extracting state
     const { data: job } = await admin
       .from('jobs')
       .select('status, total_video_count')
       .eq('id', job_id)
       .single();
 
-    if (!job || job.status !== 'extracting') {
+    if (!job || !['extracting'].includes(job.status)) {
       return NextResponse.json<ApiResponse>({
         success: true,
         data: { processed: 0, remaining: 0, message: 'Job not in extracting state' }

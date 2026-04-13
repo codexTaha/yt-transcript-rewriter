@@ -3,13 +3,13 @@
  *
  * Auth priority (all handled in Python, just set env vars):
  *   1. YOUTUBE_COOKIES_FILE  -> path to Netscape cookies.txt exported from your browser
+ *      AUTO-DETECT: if YOUTUBE_COOKIES_FILE is not set, we check ~/cookies.txt
+ *                   and ~/YT-Tools/cookies.txt automatically.
  *   2. WEBSHARE_PROXY_USERNAME + WEBSHARE_PROXY_PASSWORD -> paid rotating residential
  *   3. PROXY_URL             -> generic proxy host:port
  *   4. Direct connection     -> works locally, gets blocked on cloud VPS
- *
- * For local dev without a proxy, export cookies.txt from your browser:
- *   Chrome/Firefox extension: "Get cookies.txt LOCALLY" or "Cookie-Editor"
- *   Then set: YOUTUBE_COOKIES_FILE=/absolute/path/to/cookies.txt
+ *   --- fallback ---
+ *   5. yt-dlp subtitle fetch -> browser UA + cookies, much harder to block
  *
  * PYTHON RESOLUTION ORDER (fix for venv isolation):
  *   1. PYTHON_BIN env var  -> explicit path e.g. /home/taha/venv/bin/python3
@@ -20,6 +20,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 
 const execFileAsync = promisify(execFile);
 
@@ -27,28 +28,40 @@ const SCRIPT_PATH = path.join(process.cwd(), 'scripts', 'fetch_transcript.py');
 
 /**
  * Resolve the Python executable to use, preferring the project venv.
- * Priority:
- *   1. PYTHON_BIN env var (absolute path)
- *   2. <project-root>/venv/bin/python3  (Linux/Mac venv)
- *   3. <project-root>/venv/Scripts/python.exe  (Windows venv)
- *   4. python3  (system, Linux/Mac)
- *   5. python   (system, Windows fallback)
  */
 function resolvePython(): string {
-  // 1. Explicit override
   const explicit = process.env.PYTHON_BIN?.trim();
   if (explicit) return explicit;
 
-  // 2. Project-local venv (Linux/Mac)
   const venvUnix = path.join(process.cwd(), 'venv', 'bin', 'python3');
   if (fs.existsSync(venvUnix)) return venvUnix;
 
-  // 3. Project-local venv (Windows)
   const venvWin = path.join(process.cwd(), 'venv', 'Scripts', 'python.exe');
   if (fs.existsSync(venvWin)) return venvWin;
 
-  // 4/5. System Python
   return process.platform === 'win32' ? 'python' : 'python3';
+}
+
+/**
+ * Auto-detect a cookies.txt file on the local machine when
+ * YOUTUBE_COOKIES_FILE env var is not explicitly set.
+ * Priority: ~/cookies.txt → ~/YT-Tools/cookies.txt → project root cookies.txt
+ */
+function autoDetectCookiesFile(): string {
+  const home = os.homedir();
+  const candidates = [
+    path.join(home, 'cookies.txt'),
+    path.join(home, 'YT-Tools', 'cookies.txt'),
+    path.join(home, 'youtube_cookies.txt'),
+    path.join(process.cwd(), 'cookies.txt'),
+  ];
+  for (const p of candidates) {
+    if (fs.existsSync(p)) {
+      console.log(`[fetchTranscript] auto-detected cookies.txt at ${p}`);
+      return p;
+    }
+  }
+  return '';
 }
 
 export interface TranscriptResult {
@@ -62,12 +75,18 @@ export interface TranscriptResult {
  */
 export async function fetchTranscript(
   videoId: string,
-  timeoutMs = 60_000   // raised to 60s to handle slow proxy retries
+  timeoutMs = 90_000   // raised to 90s to account for yt-dlp fallback latency
 ): Promise<TranscriptResult> {
   const PYTHON = resolvePython();
 
+  // Resolve cookies file — explicit env var first, then auto-detect
+  const cookiesFile =
+    process.env.YOUTUBE_COOKIES_FILE?.trim()
+      ? process.env.YOUTUBE_COOKIES_FILE.trim()
+      : autoDetectCookiesFile();
+
   const authMode =
-    process.env.YOUTUBE_COOKIES_FILE                ? `cookies:${process.env.YOUTUBE_COOKIES_FILE}` :
+    cookiesFile                                     ? `cookies:${cookiesFile}` :
     process.env.WEBSHARE_PROXY_USERNAME             ? 'webshare' :
     process.env.PROXY_URL                           ? `proxy:${process.env.PROXY_URL}` :
                                                       'direct';
@@ -77,10 +96,11 @@ export async function fetchTranscript(
   // Forward all relevant env vars explicitly to the subprocess
   const env: NodeJS.ProcessEnv = {
     ...process.env,
-    YOUTUBE_COOKIES_FILE:       process.env.YOUTUBE_COOKIES_FILE       ?? '',
-    WEBSHARE_PROXY_USERNAME:    process.env.WEBSHARE_PROXY_USERNAME    ?? '',
-    WEBSHARE_PROXY_PASSWORD:    process.env.WEBSHARE_PROXY_PASSWORD    ?? '',
-    PROXY_URL:                  process.env.PROXY_URL                  ?? '',
+    // Inject auto-detected cookies path so the Python script picks it up
+    YOUTUBE_COOKIES_FILE:       cookiesFile                                  || '',
+    WEBSHARE_PROXY_USERNAME:    process.env.WEBSHARE_PROXY_USERNAME          ?? '',
+    WEBSHARE_PROXY_PASSWORD:    process.env.WEBSHARE_PROXY_PASSWORD          ?? '',
+    PROXY_URL:                  process.env.PROXY_URL                        ?? '',
   };
 
   let stdout = '';
@@ -109,7 +129,7 @@ export async function fetchTranscript(
     console.log(`[fetchTranscript] py[${videoId}]: ${stderr.trim().slice(0, 300)}`);
   }
 
-  let parsed: { success: boolean; text?: string; language?: string; error?: string };
+  let parsed: { success: boolean; text?: string; language?: string; error?: string; method?: string };
   try {
     parsed = JSON.parse(stdout.trim());
   } catch {
@@ -118,6 +138,10 @@ export async function fetchTranscript(
 
   if (!parsed.success || !parsed.text) {
     throw new Error(parsed.error ?? 'Transcript fetch failed');
+  }
+
+  if (parsed.method) {
+    console.log(`[fetchTranscript] video=${videoId} method=${parsed.method}`);
   }
 
   return { text: parsed.text, language: parsed.language ?? 'en' };

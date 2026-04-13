@@ -2,29 +2,27 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import type { ApiResponse } from '@/types';
 
-// How many videos to dispatch concurrently per pump tick.
-// Keep at 3 — enough parallelism without burst-triggering 429s.
-const BATCH_SIZE = 3;
+// Process one video at a time to avoid burst-rate YouTube IP bans.
+// yt-dlp fallback adds latency, so we keep it sequential.
+const BATCH_SIZE = 1;
 const MAX_RETRIES = 3;
 
-// Max time (ms) a video is allowed to sit in 'processing' before
-// we assume the worker crashed and reset it back to 'pending'.
-const PROCESSING_STALE_MS = 90_000; // 90 seconds
+// Delay (ms) between dispatching each video in a batch.
+// Prevents YouTube from seeing a burst of simultaneous transcript requests
+// from the same IP and triggering an IP ban.
+const DISPATCH_DELAY_MS = 1500;
+
+// Max time (ms) a video can sit in 'processing' before we assume the
+// worker crashed and reset it to 'pending'. Raised to 120s to account
+// for yt-dlp fallback which can take up to 60s.
+const PROCESSING_STALE_MS = 120_000;
+
+function sleep(ms: number) {
+  return new Promise<void>(resolve => setTimeout(resolve, ms));
+}
 
 /**
  * Resolve the base URL for internal self-calls.
- *
- * Priority:
- *   1. NEXT_PUBLIC_APP_URL env var  (set this in .env.local for local dev)
- *   2. NEXTAUTH_URL / VERCEL_URL    (common CI/hosting vars)
- *   3. http://localhost:3000         (hardcoded local fallback)
- *
- * WHY: process.env.NEXT_PUBLIC_APP_URL is often missing locally, causing
- * fire-and-forget fetch() calls to the extract worker to silently fail
- * because the URL resolves to undefined/null or a broken string.
- *
- * A console.warn is emitted when the fallback is used so developers know
- * immediately that NEXT_PUBLIC_APP_URL is missing in their .env.local.
  */
 function resolveBaseUrl(): string {
   const candidates = [
@@ -115,7 +113,8 @@ export async function POST(req: NextRequest) {
         ? `All ${failed} transcript extractions failed. ` +
           'Check: (1) YOUTUBE_COOKIES_FILE is set in .env.local, ' +
           '(2) youtube-transcript-api is installed in your venv, ' +
-          '(3) PYTHON_BIN points to your venv Python.'
+          '(3) PYTHON_BIN points to your venv Python, ' +
+          '(4) yt-dlp is installed (pip install yt-dlp).'
         : undefined;
 
       await admin
@@ -143,7 +142,7 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // --- Dispatch next batch ---
+    // --- Dispatch next batch (sequential with delay to avoid rate bans) ---
     const slots = BATCH_SIZE - (currentProcessing ?? 0);
     const { data: batch } = await admin
       .from('job_videos')
@@ -171,10 +170,12 @@ export async function POST(req: NextRequest) {
       .in('id', batch.map(v => v.id));
 
     const baseUrl = resolveBaseUrl();
-    console.log(`[pump/extract] dispatching ${batch.length} videos via ${baseUrl}`);
+    console.log(`[pump/extract] dispatching ${batch.length} video(s) via ${baseUrl} (delay=${DISPATCH_DELAY_MS}ms)`);
 
-    // Fire-and-forget — results are written to DB by the extract worker
-    batch.forEach(video => {
+    // Sequential dispatch with delay between each to avoid YouTube rate bans
+    for (let i = 0; i < batch.length; i++) {
+      if (i > 0) await sleep(DISPATCH_DELAY_MS);
+      const video = batch[i];
       fetch(`${baseUrl}/api/worker/extract`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -182,7 +183,7 @@ export async function POST(req: NextRequest) {
       }).catch((err) => {
         console.error(`[pump/extract] fire-and-forget failed for ${video.video_id}:`, err);
       });
-    });
+    }
 
     const { count: pendingAfter } = await admin
       .from('job_videos')

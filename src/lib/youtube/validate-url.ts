@@ -1,7 +1,19 @@
 import type { ValidatedYouTubeUrl } from '@/types';
 
-// Regex patterns for each YouTube URL shape
+// Regex patterns for each YouTube URL shape.
+// ORDER MATTERS: playlist must be checked before video because a URL like
+// youtube.com/watch?v=xxx&list=PLxxx matches both — we want playlist in that case.
 const PATTERNS = {
+  // Playlist: /playlist?list=xxx  OR  watch?...list=xxx (with or without v=)
+  playlist: [
+    // Clean playlist URL — most reliable
+    /youtube\.com\/playlist\?.*list=([\w-]+)/,
+    // Watch URL that has a list= param (shared playlist link from YouTube sidebar)
+    // Captures list even when v= is also present — this was the original bug:
+    // the old negative lookahead `(?!.*[&?]v=)` caused this pattern to fail
+    // for the most common case (youtube.com/watch?v=xxx&list=PLxxx).
+    /youtube\.com\/watch\?[^#]*[?&]list=([\w-]+)/,
+  ],
   // Channel: /@handle, /channel/UCxxx, /c/name, /user/name
   channel: [
     /youtube\.com\/@([\w-]+)/,
@@ -9,12 +21,8 @@ const PATTERNS = {
     /youtube\.com\/c\/([\w-]+)/,
     /youtube\.com\/user\/([\w-]+)/,
   ],
-  // Playlist: /playlist?list=xxx or any URL with list= but no v=
-  playlist: [
-    /youtube\.com\/playlist\?.*list=([\w-]+)/,
-    /youtube\.com\/watch\?.*list=([\w-]+)(?!.*[&?]v=)/,
-  ],
   // Single video: /watch?v=xxx or youtu.be/xxx
+  // Checked AFTER playlist so watch+list URLs go to playlist, not video.
   video: [
     /youtube\.com\/watch\?.*v=([\w-]{11})/,
     /youtu\.be\/([\w-]{11})/,
@@ -35,6 +43,10 @@ function normalizeChannelUrl(url: string): string {
 /**
  * Validates and classifies a YouTube URL.
  * Returns a structured result or null if invalid.
+ *
+ * Priority: playlist > channel > video
+ * Rationale: a watch?v=xxx&list=PLxxx URL should be treated as a playlist job,
+ * not a single-video job. The user pasted a playlist link.
  */
 export function validateYouTubeUrl(rawUrl: string): ValidatedYouTubeUrl | null {
   const url = rawUrl.trim();
@@ -42,19 +54,7 @@ export function validateYouTubeUrl(rawUrl: string): ValidatedYouTubeUrl | null {
   // Must contain youtube.com or youtu.be
   if (!/youtube\.com|youtu\.be/.test(url)) return null;
 
-  // Check video first (most specific)
-  for (const pattern of PATTERNS.video) {
-    const match = url.match(pattern);
-    if (match) {
-      return {
-        type: 'video',
-        normalizedUrl: `https://www.youtube.com/watch?v=${match[1]}`,
-        rawId: match[1],
-      };
-    }
-  }
-
-  // Check playlist
+  // 1. Check playlist first
   for (const pattern of PATTERNS.playlist) {
     const match = url.match(pattern);
     if (match) {
@@ -66,7 +66,7 @@ export function validateYouTubeUrl(rawUrl: string): ValidatedYouTubeUrl | null {
     }
   }
 
-  // Check channel
+  // 2. Check channel
   for (const pattern of PATTERNS.channel) {
     const match = url.match(pattern);
     if (match) {
@@ -74,6 +74,18 @@ export function validateYouTubeUrl(rawUrl: string): ValidatedYouTubeUrl | null {
       return {
         type: 'channel',
         normalizedUrl: normalized,
+        rawId: match[1],
+      };
+    }
+  }
+
+  // 3. Check single video last
+  for (const pattern of PATTERNS.video) {
+    const match = url.match(pattern);
+    if (match) {
+      return {
+        type: 'video',
+        normalizedUrl: `https://www.youtube.com/watch?v=${match[1]}`,
         rawId: match[1],
       };
     }

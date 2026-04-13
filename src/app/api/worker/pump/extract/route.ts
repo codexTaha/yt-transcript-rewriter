@@ -22,6 +22,9 @@ const PROCESSING_STALE_MS = 90_000; // 90 seconds
  * WHY: process.env.NEXT_PUBLIC_APP_URL is often missing locally, causing
  * fire-and-forget fetch() calls to the extract worker to silently fail
  * because the URL resolves to undefined/null or a broken string.
+ *
+ * A console.warn is emitted when the fallback is used so developers know
+ * immediately that NEXT_PUBLIC_APP_URL is missing in their .env.local.
  */
 function resolveBaseUrl(): string {
   const candidates = [
@@ -32,6 +35,11 @@ function resolveBaseUrl(): string {
   for (const c of candidates) {
     if (c && c.trim() && c.trim() !== 'undefined') return c.trim().replace(/\/$/, '');
   }
+  console.warn(
+    '[pump/extract] NEXT_PUBLIC_APP_URL is not set in .env.local — ' +
+    'falling back to http://localhost:3000. ' +
+    'Set NEXT_PUBLIC_APP_URL=http://localhost:3000 in your .env.local to suppress this warning.'
+  );
   return 'http://localhost:3000';
 }
 

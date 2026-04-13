@@ -27,6 +27,7 @@ export default function NewJobPage() {
     if (!validateUrl(url)) return;
     setLoading(true);
     try {
+      // Step 1: Create the job record
       const createRes = await fetch('/api/jobs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -35,7 +36,19 @@ export default function NewJobPage() {
       const createData = await createRes.json();
       if (!createData.success) throw new Error(createData.error);
       const jobId = createData.data.job_id;
-      fetch(`/api/jobs/${jobId}/discover`, { method: 'POST' }).catch(() => {});
+
+      // Step 2: Fire discovery — do NOT swallow errors silently.
+      // If the discover call fails to even start (network error, missing API key
+      // surfaced immediately, etc.) we show a toast so the user is not left
+      // staring at a stalled job page wondering why nothing is happening.
+      fetch(`/api/jobs/${jobId}/discover`, { method: 'POST' }).catch((networkErr) => {
+        console.error('[jobs/new] discover fetch failed:', networkErr);
+        toast.error(
+          'Discovery request failed to send. Check your network and that the dev server is running.',
+          { duration: 8000 }
+        );
+      });
+
       router.push(`/jobs/${jobId}`);
     } catch (err: unknown) {
       toast.error(err instanceof Error ? err.message : 'Failed to create job');
@@ -80,7 +93,7 @@ export default function NewJobPage() {
           <div className="rounded-md border border-yellow-500/20 bg-yellow-500/5 px-4 py-3 text-xs text-yellow-400 space-y-1">
             <p className="font-semibold text-yellow-300">About filters (likes & watch-time)</p>
             <p>
-              YouTube’s public API v3 has not returned <strong>like counts</strong> since December 2021.
+              YouTube&apos;s public API v3 has not returned <strong>like counts</strong> since December 2021.
               <strong> Watch-time</strong> (total hours viewed) is only available in YouTube Studio to channel owners, not via any public API.
             </p>
             <p>

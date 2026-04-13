@@ -23,6 +23,19 @@ function parseDuration(iso: string): number {
   );
 }
 
+/** Extract a human-readable error message from a YouTube API JSON error body */
+async function extractYtError(res: Response, fallback: string): Promise<string> {
+  try {
+    const body = await res.json();
+    const msg = body?.error?.message;
+    if (msg) return msg;
+    // Surface quota-exceeded reason explicitly
+    const reason = body?.error?.errors?.[0]?.reason;
+    if (reason === 'quotaExceeded') return 'YouTube API daily quota exceeded. Wait 24 h or use a different API key.';
+  } catch { /* ignore JSON parse failure */ }
+  return fallback;
+}
+
 /** Fetch all video IDs from a playlist, paginating through all pages */
 async function fetchPlaylistVideos(
   playlistId: string
@@ -42,11 +55,7 @@ async function fetchPlaylistVideos(
 
     const res = await fetch(`${YT_API_BASE}/playlistItems?${params}`);
     if (!res.ok) {
-      let errMsg = `YouTube API error: ${res.status}`;
-      try {
-        const err = await res.json();
-        errMsg = err?.error?.message ?? errMsg;
-      } catch { /* ignore JSON parse failure */ }
+      const errMsg = await extractYtError(res, `YouTube API error fetching playlist items: ${res.status}`);
       throw new Error(errMsg);
     }
     const data = await res.json();
@@ -66,7 +75,16 @@ async function fetchPlaylistVideos(
   return { videoIds, titles };
 }
 
-/** Fetch video details (duration, channel) for a batch of video IDs */
+/**
+ * Fetch video details (duration, channel) for a batch of video IDs.
+ *
+ * Previously this silently skipped failed batches with console.warn, which meant
+ * all videos got duration_seconds=0. When a minDuration filter is set (even 0),
+ * this caused every video to be filtered out — the "No videos matched filters" bug.
+ *
+ * Now throws immediately on any 4xx/5xx so the job fails with a clear error
+ * message rather than silently filtering out all results.
+ */
 async function fetchVideoDetails(
   videoIds: string[]
 ): Promise<Map<string, { duration: number; channelTitle: string }>> {
@@ -83,8 +101,13 @@ async function fetchVideoDetails(
 
     const res = await fetch(`${YT_API_BASE}/videos?${params}`);
     if (!res.ok) {
-      console.warn(`[discover] fetchVideoDetails batch ${i} failed with ${res.status}, skipping`);
-      continue;
+      // Throw instead of silently skipping — a failed batch means durations
+      // will be 0 for those videos, which breaks the min-duration filter.
+      const errMsg = await extractYtError(
+        res,
+        `YouTube API error fetching video details (batch ${i / 50 + 1}): ${res.status}`
+      );
+      throw new Error(errMsg);
     }
     const data = await res.json();
 
@@ -169,7 +192,10 @@ export async function discoverVideos(
       key: apiKey(),
     });
     const res = await fetch(`${YT_API_BASE}/videos?${params}`);
-    if (!res.ok) throw new Error(`YouTube API error: ${res.status}`);
+    if (!res.ok) {
+      const errMsg = await extractYtError(res, `YouTube API error: ${res.status}`);
+      throw new Error(errMsg);
+    }
     const data = await res.json();
     const video = data.items?.[0];
     if (!video) throw new Error('Video not found or is private.');
@@ -190,7 +216,7 @@ export async function discoverVideos(
 
   // ─── Playlist ───
   if (type === 'playlist') {
-    // Get playlist metadata — with proper error handling
+    // Get playlist metadata — distinguish 403 (quota/key) from 404 (not found)
     const metaParams = new URLSearchParams({
       part: 'snippet',
       id: rawId,
@@ -198,18 +224,18 @@ export async function discoverVideos(
     });
     const metaRes = await fetch(`${YT_API_BASE}/playlists?${metaParams}`);
     if (!metaRes.ok) {
-      let errMsg = `YouTube API error fetching playlist metadata: ${metaRes.status}`;
-      try {
-        const errBody = await metaRes.json();
-        errMsg = errBody?.error?.message ?? errMsg;
-      } catch { /* ignore */ }
+      const errMsg = await extractYtError(
+        metaRes,
+        `YouTube API error fetching playlist metadata: ${metaRes.status}`
+      );
       throw new Error(errMsg);
     }
     const metaData = await metaRes.json();
     if (!metaData.items || metaData.items.length === 0) {
       throw new Error(
-        `Playlist not found or is private (id: ${rawId}). ` +
-        'Make sure the playlist is public and the ID in the URL is correct.'
+        `Playlist not found or is private/unlisted (id: ${rawId}). ` +
+        'Make sure the playlist is set to Public and the ID in the URL is correct. ' +
+        'Unlisted playlists are not accessible via the YouTube Data API.'
       );
     }
     const playlistTitle = metaData.items[0]?.snippet?.title ?? 'Playlist';

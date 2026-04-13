@@ -2,28 +2,20 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import type { ApiResponse } from '@/types';
 
-// Process one video at a time to avoid burst-rate YouTube IP bans.
-// yt-dlp fallback adds latency, so we keep it sequential.
 const BATCH_SIZE = 1;
 const MAX_RETRIES = 3;
 
-// Delay (ms) between dispatching each video in a batch.
-// Prevents YouTube from seeing a burst of simultaneous transcript requests
-// from the same IP and triggering an IP ban.
-const DISPATCH_DELAY_MS = 1500;
+// Delay between dispatching each video. 8s gives YouTube time to breathe
+// and avoids triggering rate bans on sequential requests.
+const DISPATCH_DELAY_MS = 8_000;
 
-// Max time (ms) a video can sit in 'processing' before we assume the
-// worker crashed and reset it to 'pending'. Raised to 120s to account
-// for yt-dlp fallback which can take up to 60s.
+// Stale processing timeout — raised to 120s to account for yt-dlp fallback
 const PROCESSING_STALE_MS = 120_000;
 
 function sleep(ms: number) {
   return new Promise<void>(resolve => setTimeout(resolve, ms));
 }
 
-/**
- * Resolve the base URL for internal self-calls.
- */
 function resolveBaseUrl(): string {
   const candidates = [
     process.env.NEXT_PUBLIC_APP_URL,
@@ -34,9 +26,7 @@ function resolveBaseUrl(): string {
     if (c && c.trim() && c.trim() !== 'undefined') return c.trim().replace(/\/$/, '');
   }
   console.warn(
-    '[pump/extract] NEXT_PUBLIC_APP_URL is not set in .env.local — ' +
-    'falling back to http://localhost:3000. ' +
-    'Set NEXT_PUBLIC_APP_URL=http://localhost:3000 in your .env.local to suppress this warning.'
+    '[pump/extract] NEXT_PUBLIC_APP_URL is not set — falling back to http://localhost:3000'
   );
   return 'http://localhost:3000';
 }
@@ -68,7 +58,7 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // --- Unstick stale 'processing' rows ---
+    // Unstick stale 'processing' rows
     const staleThreshold = new Date(Date.now() - PROCESSING_STALE_MS).toISOString();
     await admin
       .from('job_videos')
@@ -77,7 +67,6 @@ export async function POST(req: NextRequest) {
       .eq('transcript_status', 'processing')
       .lt('transcript_attempted_at', staleThreshold);
 
-    // --- Count pending / processing ---
     const { count: currentPending } = await admin
       .from('job_videos')
       .select('*', { count: 'exact', head: true })
@@ -91,7 +80,7 @@ export async function POST(req: NextRequest) {
       .eq('job_id', job_id)
       .eq('transcript_status', 'processing');
 
-    // --- All done? Advance job status ---
+    // All done? Advance job status
     if ((currentPending ?? 0) === 0 && (currentProcessing ?? 0) === 0) {
       const { count: successCount } = await admin
         .from('job_videos')
@@ -111,10 +100,11 @@ export async function POST(req: NextRequest) {
       const nextStatus = success === 0 ? 'failed' : 'awaiting_prompt';
       const errorMsg   = success === 0
         ? `All ${failed} transcript extractions failed. ` +
-          'Check: (1) YOUTUBE_COOKIES_FILE is set in .env.local, ' +
-          '(2) youtube-transcript-api is installed in your venv, ' +
-          '(3) PYTHON_BIN points to your venv Python, ' +
-          '(4) yt-dlp is installed (pip install yt-dlp).'
+          'Your IP is likely blocked by YouTube. Fix: ' +
+          '(1) Run: pip install --upgrade youtube-transcript-api  ' +
+          '(2) Make sure YOUTUBE_COOKIES_FILE is set or ~/cookies.txt exists  ' +
+          '(3) Wait 30-60 minutes for the IP ban to lift  ' +
+          '(4) Try with a VPN or proxy (PROXY_URL env var)'
         : undefined;
 
       await admin
@@ -134,7 +124,7 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // --- Throttle: don't dispatch more if already processing ---
+    // Throttle: don't dispatch more if already processing
     if ((currentProcessing ?? 0) >= BATCH_SIZE) {
       return NextResponse.json<ApiResponse>({
         success: true,
@@ -142,7 +132,7 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // --- Dispatch next batch (sequential with delay to avoid rate bans) ---
+    // Dispatch next video
     const slots = BATCH_SIZE - (currentProcessing ?? 0);
     const { data: batch } = await admin
       .from('job_videos')
@@ -160,7 +150,6 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // Mark as processing BEFORE firing requests
     await admin
       .from('job_videos')
       .update({
@@ -170,9 +159,8 @@ export async function POST(req: NextRequest) {
       .in('id', batch.map(v => v.id));
 
     const baseUrl = resolveBaseUrl();
-    console.log(`[pump/extract] dispatching ${batch.length} video(s) via ${baseUrl} (delay=${DISPATCH_DELAY_MS}ms)`);
+    console.log(`[pump/extract] dispatching ${batch.length} video(s) via ${baseUrl} (cooldown=${DISPATCH_DELAY_MS}ms between requests)`);
 
-    // Sequential dispatch with delay between each to avoid YouTube rate bans
     for (let i = 0; i < batch.length; i++) {
       if (i > 0) await sleep(DISPATCH_DELAY_MS);
       const video = batch[i];

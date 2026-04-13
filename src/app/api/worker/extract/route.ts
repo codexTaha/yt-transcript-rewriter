@@ -3,18 +3,30 @@ import { createAdminClient } from '@/lib/supabase/admin';
 import { fetchTranscript } from '@/lib/transcript/fetchTranscript';
 import type { ApiResponse } from '@/types';
 
-// Error messages that mean the video is permanently gone — no point retrying
+// Error messages that mean the video is permanently unrecoverable — no point retrying.
+// IMPORTANT: IP-block / 429 errors are treated as permanent because retrying
+// a blocked IP just triggers more bans and makes the situation worse.
+// The user needs to wait out the block or fix their cookies/proxy setup.
 const PERMANENT_ERROR_PATTERNS = [
+  // IP blocks & rate limits — retrying makes it worse
+  'youtube is blocking requests from your ip',
+  'ipblocked',
+  'requestblocked',
+  'http error 429',
+  'too many requests',
+  '429',
+  // Permanently gone videos
   'account associated with this video has been terminated',
   'video has been removed',
-  'This video is unavailable',
-  'Transcripts are disabled',
-  'TranscriptsDisabled',
-  'This video is private',
+  'this video is unavailable',
+  'transcripts are disabled',
+  'transcriptsdisabled',
+  'this video is private',
 ];
 
 function isPermanentError(msg: string): boolean {
-  return PERMANENT_ERROR_PATTERNS.some(p => msg.toLowerCase().includes(p.toLowerCase()));
+  const lower = msg.toLowerCase();
+  return PERMANENT_ERROR_PATTERNS.some(p => lower.includes(p.toLowerCase()));
 }
 
 export async function POST(req: NextRequest) {
@@ -36,7 +48,6 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Bail immediately if the job was cancelled
     const { data: job } = await admin
       .from('jobs')
       .select('status')
@@ -67,8 +78,14 @@ export async function POST(req: NextRequest) {
         .single();
 
       const retryCount = (current?.transcript_retry_count ?? 0) + 1;
-      // Permanently failed errors or exceeded retry limit → mark as failed immediately
-      const newStatus = isPermanentError(errMsg) || retryCount >= 3 ? 'failed' : 'pending';
+
+      // IP blocks / 429 = permanent. Don't waste retries hammering a blocked IP.
+      const permanent = isPermanentError(errMsg) || retryCount >= 3;
+      const newStatus = permanent ? 'failed' : 'pending';
+
+      if (permanent && isPermanentError(errMsg)) {
+        console.warn(`[extract] video ${video_id}: IP block detected — marking as failed immediately, not retrying.`);
+      }
 
       await admin
         .from('job_videos')
@@ -85,7 +102,6 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Upload to Supabase Storage
     const storagePath = `${job_id}/${video_id}/transcript.txt`;
     const { error: uploadError } = await admin
       .storage
@@ -122,10 +138,7 @@ export async function POST(req: NextRequest) {
     if (job_video_id) {
       await admin
         .from('job_videos')
-        .update({
-          transcript_status: 'failed',
-          transcript_error: message,
-        })
+        .update({ transcript_status: 'failed', transcript_error: message })
         .eq('id', job_video_id)
         .catch(() => {});
     }

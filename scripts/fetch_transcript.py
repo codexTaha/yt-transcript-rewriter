@@ -9,7 +9,10 @@ Auth priority:
   4. PROXY_URL (host:port)           -> GenericProxyConfig
   5. Direct (no auth)
   --- if all above fail for a video ---
-  6. yt-dlp subtitle fallback       -> uses browser UA + cookies, harder to block
+  6. yt-dlp subtitle fallback       -> browser UA + cookies, harder to block
+
+Fix note: CookieConfig was added in youtube-transcript-api 0.10.0.
+This script handles both old and new versions gracefully.
 
 Usage:
   python fetch_transcript.py <video_id>
@@ -29,25 +32,21 @@ import time
 
 def resolve_cookies_file() -> str:
     """Return the first cookies.txt path that actually exists, or empty string."""
-    # Explicit env var wins
     explicit = os.environ.get("YOUTUBE_COOKIES_FILE", "").strip()
     if explicit and os.path.isfile(explicit):
         return explicit
 
-    # Auto-detect well-known local paths (Fedora dev machine defaults)
     home = os.path.expanduser("~")
     candidates = [
         os.path.join(home, "cookies.txt"),
         os.path.join(home, "YT-Tools", "cookies.txt"),
         os.path.join(home, "youtube_cookies.txt"),
-        # project root relative
         os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cookies.txt"),
     ]
     for path in candidates:
         if os.path.isfile(path):
             print(f"[fetch_transcript] auto-detected cookies.txt at {path}", file=sys.stderr)
             return path
-
     return ""
 
 
@@ -56,6 +55,9 @@ def resolve_cookies_file() -> str:
 def build_api():
     """
     Build a YouTubeTranscriptApi instance with best available auth.
+    Handles both:
+      - New API (>=0.10.0): YouTubeTranscriptApi(cookie_config=CookieConfig(...))
+      - Old API (<0.10.0):  YouTubeTranscriptApi(cookies_path=...)
     Returns (ytt_api, description_string).
     """
     from youtube_transcript_api import YouTubeTranscriptApi
@@ -64,14 +66,34 @@ def build_api():
 
     # --- Priority 1 & 2: cookies.txt ---
     if cookies_file:
+        # Try new API first (>=0.10.0)
         try:
             from youtube_transcript_api.cookies import CookieConfig
             cookie_config = CookieConfig(cookie_file=cookies_file)
             ytt_api = YouTubeTranscriptApi(cookie_config=cookie_config)
-            print(f"[fetch_transcript] using CookieConfig from {cookies_file}", file=sys.stderr)
+            print(f"[fetch_transcript] using CookieConfig (new API) from {cookies_file}", file=sys.stderr)
             return ytt_api, f"cookies:{cookies_file}"
-        except (ImportError, Exception) as e:
-            print(f"[fetch_transcript] CookieConfig failed ({e}), trying next option", file=sys.stderr)
+        except ImportError:
+            pass  # Old version, try legacy path
+        except Exception as e:
+            print(f"[fetch_transcript] CookieConfig failed ({e}), trying legacy cookie path", file=sys.stderr)
+
+        # Try old API (<0.10.0) — cookies_path kwarg
+        try:
+            ytt_api = YouTubeTranscriptApi(cookies_path=cookies_file)
+            print(f"[fetch_transcript] using cookies_path (legacy API) from {cookies_file}", file=sys.stderr)
+            return ytt_api, f"cookies_legacy:{cookies_file}"
+        except TypeError:
+            pass  # Neither old nor new — version in between, skip cookies
+        except Exception as e:
+            print(f"[fetch_transcript] legacy cookies_path failed ({e}), continuing without cookies", file=sys.stderr)
+
+        print(
+            f"[fetch_transcript] WARNING: cookies.txt found at {cookies_file} but could not be loaded. "
+            f"Your youtube-transcript-api may be outdated. "
+            f"Run: pip install --upgrade youtube-transcript-api",
+            file=sys.stderr
+        )
 
     # --- Priority 3: Webshare rotating residential ---
     ws_user = os.environ.get("WEBSHARE_PROXY_USERNAME", "").strip()
@@ -113,9 +135,8 @@ def build_api():
 def fetch_via_ytdlp(video_id: str) -> dict:
     """
     Fallback: use yt-dlp to download auto-generated subtitles.
-    yt-dlp uses a browser-like user-agent and handles cookies natively,
-    making it much harder for YouTube to block than raw HTTP requests.
-    Returns same shape as fetch(): {success, text, language, method} or {success, error}.
+    yt-dlp uses a browser-like user-agent and handles cookies natively.
+    Retries once after 15s if it gets a 429.
     """
     import subprocess
     import tempfile
@@ -126,81 +147,84 @@ def fetch_via_ytdlp(video_id: str) -> dict:
 
     cookies_file = resolve_cookies_file()
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    def run_ytdlp(tmpdir: str) -> subprocess.CompletedProcess:
         cmd = [
             "yt-dlp",
             "--write-auto-sub",
             "--skip-download",
             "--sub-format", "json3",
-            "--sub-langs", "en.*",
+            "--sub-langs", "en,en-orig,en-US,en-GB",
             "--output", os.path.join(tmpdir, "%(id)s.%(ext)s"),
             "--no-playlist",
             "--quiet",
             "--no-warnings",
+            "--user-agent",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         ]
         if cookies_file:
             cmd += ["--cookies", cookies_file]
-
         cmd.append(f"https://www.youtube.com/watch?v={video_id}")
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=90)
 
+    def parse_json3_or_vtt(tmpdir: str):
+        """Parse downloaded subtitle file into plain text. Returns text or None."""
+        json3_files = glob.glob(os.path.join(tmpdir, "*.json3"))
+        if json3_files:
+            with open(json3_files[0], encoding="utf-8") as f:
+                data = json.load(f)
+            words = []
+            for event in data.get("events", []):
+                for seg in event.get("segs", []):
+                    word = seg.get("utf8", "").strip()
+                    if word and word != "\n":
+                        words.append(word)
+            text = " ".join(" ".join(words).split())
+            if len(text) >= 50:
+                return text, "yt-dlp/json3"
+
+        vtt_files = glob.glob(os.path.join(tmpdir, "*.vtt"))
+        if vtt_files:
+            with open(vtt_files[0], encoding="utf-8") as f:
+                raw = f.read()
+            lines = []
+            for line in raw.splitlines():
+                if re.match(r'^\d{2}:\d{2}', line) or line.strip() == "WEBVTT" or re.match(r'^\s*$', line):
+                    continue
+                clean = re.sub(r'<[^>]+>', '', line).strip()
+                if clean:
+                    lines.append(clean)
+            text = " ".join(" ".join(lines).split())
+            if len(text) >= 50:
+                return text, "yt-dlp/vtt"
+
+        return None, None
+
+    with tempfile.TemporaryDirectory() as tmpdir:
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
+            result = run_ytdlp(tmpdir)
         except FileNotFoundError:
             return {"success": False, "error": "yt-dlp is not installed (fix: pip install yt-dlp or sudo dnf install yt-dlp)"}
         except subprocess.TimeoutExpired:
-            return {"success": False, "error": "yt-dlp timed out after 60s"}
+            return {"success": False, "error": "yt-dlp timed out after 90s"}
+
+        # 429 — wait 15s and retry once
+        if result.returncode != 0 and "429" in (result.stderr or ""):
+            print(f"[fetch_transcript] yt-dlp got 429, waiting 15s before retry...", file=sys.stderr)
+            time.sleep(15)
+            try:
+                result = run_ytdlp(tmpdir)
+            except subprocess.TimeoutExpired:
+                return {"success": False, "error": "yt-dlp retry timed out after 90s"}
 
         if result.returncode != 0:
-            stderr_snippet = result.stderr.strip()[:300] if result.stderr else "(no stderr)"
+            stderr_snippet = (result.stderr or "").strip()[:300]
             return {"success": False, "error": f"yt-dlp exited {result.returncode}: {stderr_snippet}"}
 
-        # Find the downloaded .json3 subtitle file
-        json3_files = glob.glob(os.path.join(tmpdir, "*.json3"))
-        if not json3_files:
-            # Try .vtt as secondary format
-            vtt_files = glob.glob(os.path.join(tmpdir, "*.vtt"))
-            if vtt_files:
-                with open(vtt_files[0], encoding="utf-8") as f:
-                    raw = f.read()
-                # Strip VTT header and timecode lines
-                lines = []
-                for line in raw.splitlines():
-                    if re.match(r'^\d{2}:\d{2}', line) or line.strip() == "WEBVTT" or re.match(r'^\s*$', line):
-                        continue
-                    # Remove inline tags like <00:00:01.000><c>
-                    clean = re.sub(r'<[^>]+>', '', line).strip()
-                    if clean:
-                        lines.append(clean)
-                text = " ".join(lines)
-                text = " ".join(text.split())
-                if len(text) >= 50:
-                    return {"success": True, "text": text, "language": "en", "method": "yt-dlp/vtt"}
-            return {"success": False, "error": "yt-dlp ran but produced no subtitle files (video may have no auto-captions)"}
+        text, method = parse_json3_or_vtt(tmpdir)
+        if text:
+            return {"success": True, "text": text, "language": "en", "method": method}
 
-        # Parse json3 format
-        with open(json3_files[0], encoding="utf-8") as f:
-            data = json.load(f)
-
-        # json3 structure: {"events": [{"segs": [{"utf8": "text"}, ...]}, ...]}
-        words = []
-        for event in data.get("events", []):
-            for seg in event.get("segs", []):
-                word = seg.get("utf8", "").strip()
-                if word and word != "\n":
-                    words.append(word)
-
-        text = " ".join(words)
-        text = " ".join(text.split())  # Collapse whitespace
-
-        if len(text) < 50:
-            return {"success": False, "error": "yt-dlp subtitles too short or empty"}
-
-        return {"success": True, "text": text, "language": "en", "method": "yt-dlp/json3"}
+        return {"success": False, "error": "yt-dlp ran but produced no subtitle files (video may have no auto-captions)"}
 
 
 # ─── Main fetch function ───────────────────────────────────────────────────────
@@ -224,7 +248,6 @@ def fetch(video_id: str) -> dict:
         transcript = None
         lang_info = None
 
-        # 1. Try English first
         try:
             transcript = transcript_list.find_transcript(["en"])
             lang_type = "auto-generated" if transcript.is_generated else "manual"
@@ -232,7 +255,6 @@ def fetch(video_id: str) -> dict:
         except NoTranscriptFound:
             pass
 
-        # 2. Try translatable -> translate to English
         if transcript is None:
             for available in transcript_list:
                 if available.is_translatable:
@@ -242,7 +264,6 @@ def fetch(video_id: str) -> dict:
                         lang_info = f"Translated from {available.language}"
                         break
 
-        # 3. Fall back to any available language
         if transcript is None:
             available_list = list(transcript_list)
             if available_list:
@@ -266,7 +287,6 @@ def fetch(video_id: str) -> dict:
                 return {"success": True, "text": text, "language": lang_info, "auth": auth_desc, "method": "youtube-transcript-api"}
 
     except TranscriptsDisabled:
-        # Permanently disabled — skip yt-dlp fallback
         return {"success": False, "error": "Transcripts are disabled for this video"}
     except NoTranscriptFound:
         api_error = "No transcript found for this video"
@@ -275,13 +295,12 @@ def fetch(video_id: str) -> dict:
     except Exception as e:
         api_error = str(e)
 
-    # ── yt-dlp fallback ──────────────────────────────────────────────────────
+    # ── yt-dlp fallback
     print(f"[fetch_transcript] youtube-transcript-api failed ({api_error}), trying yt-dlp", file=sys.stderr)
     ytdlp_result = fetch_via_ytdlp(video_id)
     if ytdlp_result.get("success"):
         return ytdlp_result
 
-    # Both methods failed — return the most informative error
     combined = f"{api_error} | yt-dlp: {ytdlp_result.get('error', 'unknown')}"
     return {"success": False, "error": combined}
 

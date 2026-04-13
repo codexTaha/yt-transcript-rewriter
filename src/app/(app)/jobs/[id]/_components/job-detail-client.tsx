@@ -5,13 +5,11 @@ import { useRouter } from 'next/navigation';
 import { createClient } from '@/lib/supabase/client';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { Textarea } from '@/components/ui/textarea';
 import { toast } from 'sonner';
 import {
   Loader2, X, FileText, Trash2, Download,
-  Sparkles, ChevronRight, AlertTriangle, ChevronDown,
+  ChevronRight, AlertTriangle, FileDown,
 } from 'lucide-react';
-import { FREE_MODELS, DEFAULT_MODEL } from '@/lib/ai/models';
 
 type Job = Record<string, unknown>;
 type JobVideo = Record<string, unknown>;
@@ -20,10 +18,7 @@ const STATUS_LABELS: Record<string, string> = {
   created:               'Created',
   discovering:           'Discovering',
   extracting:            'Extracting',
-  awaiting_prompt:       'Ready for Prompt',
-  queued_for_rewrite:    'Queued for Rewrite',
-  rewriting:             'Rewriting',
-  building_export:       'Building Export',
+  awaiting_prompt:       'Transcripts Ready',
   completed:             'Completed',
   completed_with_errors: 'Done with Errors',
   failed:                'Failed',
@@ -34,10 +29,7 @@ const STATUS_VARIANTS: Record<string, 'default' | 'secondary' | 'success' | 'war
   created:               'secondary',
   discovering:           'default',
   extracting:            'default',
-  awaiting_prompt:       'warning',
-  queued_for_rewrite:    'default',
-  rewriting:             'default',
-  building_export:       'default',
+  awaiting_prompt:       'success',
   completed:             'success',
   completed_with_errors: 'warning',
   failed:                'destructive',
@@ -52,24 +44,9 @@ const TRANSCRIPT_VARIANTS: Record<string, 'default' | 'secondary' | 'success' | 
   skipped:    'secondary',
 };
 
-const REWRITE_VARIANTS: Record<string, 'default' | 'secondary' | 'success' | 'warning' | 'destructive'> = {
-  not_started: 'secondary',
-  queued:      'default',
-  processing:  'default',
-  done:        'success',
-  failed:      'destructive',
-};
-
-const CANCELLABLE_STATUSES = [
-  'created', 'discovering', 'extracting',
-  'awaiting_prompt', 'queued_for_rewrite', 'rewriting', 'building_export',
-];
-
-const ACTIVE_STATUSES   = new Set(['created','discovering','extracting','awaiting_prompt','queued_for_rewrite','rewriting','building_export']);
-const TERMINAL_STATUSES = new Set(['completed','completed_with_errors','failed','cancelled']);
-const MODAL_TRIGGER_STATUSES = new Set(['awaiting_prompt','completed','completed_with_errors']);
-
-type ModalState = 'none' | 'transcript_complete' | 'prompt' | 'export_ready';
+const CANCELLABLE_STATUSES = ['created', 'discovering', 'extracting'];
+const ACTIVE_STATUSES      = new Set(['created', 'discovering', 'extracting']);
+const TERMINAL_STATUSES    = new Set(['awaiting_prompt', 'completed', 'completed_with_errors', 'failed', 'cancelled']);
 
 function sleep(ms: number) { return new Promise<void>(r => setTimeout(r, ms)); }
 
@@ -96,7 +73,7 @@ function TranscriptModal({ jobId, video, onClose }: { jobId: string; video: JobV
   }, [onClose]);
 
   const wordCount = typeof video.transcript_word_count === 'number' ? video.transcript_word_count as number : null;
-  const language  = typeof video.transcript_language  === 'string' ? (video.transcript_language  as string).toUpperCase() : null;
+  const language  = typeof video.transcript_language  === 'string' ? (video.transcript_language as string).toUpperCase() : null;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
@@ -129,253 +106,106 @@ function TranscriptModal({ jobId, video, onClose }: { jobId: string; video: JobV
   );
 }
 
-// ─── Transcript Complete Modal ────────────────────────────────────────────────
-function TranscriptCompleteModal({ transcriptCount, onRewrite, onExportRaw, onDismiss, exportingRaw }: {
-  transcriptCount: number; onRewrite: () => void; onExportRaw: () => void;
-  onDismiss: () => void; exportingRaw: boolean;
-}) {
-  useEffect(() => {
-    const h = (e: KeyboardEvent) => { if (e.key === 'Escape') onDismiss(); };
-    window.addEventListener('keydown', h);
-    return () => window.removeEventListener('keydown', h);
-  }, [onDismiss]);
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
-         onClick={e => { if (e.target === e.currentTarget) onDismiss(); }}>
-      <div className="bg-card border border-border rounded-xl shadow-2xl w-full max-w-md mx-4 overflow-hidden">
-        <div className="bg-gradient-to-br from-primary/10 to-transparent px-6 pt-6 pb-4">
-          <div className="flex items-start justify-between gap-4">
-            <div>
-              <div className="flex items-center gap-2 mb-1">
-                <div className="h-7 w-7 rounded-full bg-green-500/20 flex items-center justify-center"><span className="text-sm">✅</span></div>
-                <h2 className="text-lg font-bold text-foreground">Transcripts Ready!</h2>
-              </div>
-              <p className="text-sm text-muted-foreground">
-                <strong className="text-foreground">{transcriptCount}</strong> transcript{transcriptCount !== 1 ? 's' : ''} extracted.
-              </p>
-            </div>
-            <button onClick={onDismiss} className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors shrink-0">
-              <X className="h-4 w-4" />
-            </button>
-          </div>
-        </div>
-        <div className="px-6 pb-6 pt-2 flex flex-col gap-3">
-          <button onClick={onRewrite}
-            className="w-full flex items-center gap-4 p-4 rounded-xl border-2 border-primary/30 bg-primary/5 hover:border-primary hover:bg-primary/10 transition-all text-left group">
-            <div className="p-2.5 rounded-lg bg-primary/15 text-primary shrink-0"><Sparkles className="h-5 w-5" /></div>
-            <div className="flex-1 min-w-0">
-              <p className="font-semibold text-foreground group-hover:text-primary transition-colors">Rewrite with AI</p>
-              <p className="text-xs text-muted-foreground mt-0.5">Enter a prompt — AI rewrites all transcripts.</p>
-            </div>
-            <ChevronRight className="h-4 w-4 text-muted-foreground group-hover:text-primary transition-colors shrink-0" />
-          </button>
-          <button onClick={onExportRaw} disabled={exportingRaw}
-            className="w-full flex items-center gap-4 p-4 rounded-xl border border-border bg-background hover:border-primary/40 hover:bg-muted/50 transition-all text-left group disabled:opacity-60 disabled:cursor-not-allowed">
-            <div className="p-2.5 rounded-lg bg-muted text-muted-foreground shrink-0">
-              {exportingRaw ? <Loader2 className="h-5 w-5 animate-spin" /> : <Download className="h-5 w-5" />}
-            </div>
-            <div className="flex-1 min-w-0">
-              <p className="font-semibold text-foreground">Export raw transcripts</p>
-              <p className="text-xs text-muted-foreground mt-0.5">Download as <code className="font-mono">.txt</code>.</p>
-            </div>
-            <ChevronRight className="h-4 w-4 text-muted-foreground group-hover:text-foreground transition-colors shrink-0" />
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ─── Export Ready Modal ───────────────────────────────────────────────────────
-function ExportReadyModal({ rewriteCount, hasErrors, onDownload, onExportRaw, onDismiss, downloading, exportingRaw }: {
-  rewriteCount: number; hasErrors: boolean; onDownload: () => void; onExportRaw: () => void;
-  onDismiss: () => void; downloading: boolean; exportingRaw: boolean;
-}) {
-  useEffect(() => {
-    const h = (e: KeyboardEvent) => { if (e.key === 'Escape') onDismiss(); };
-    window.addEventListener('keydown', h);
-    return () => window.removeEventListener('keydown', h);
-  }, [onDismiss]);
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
-         onClick={e => { if (e.target === e.currentTarget) onDismiss(); }}>
-      <div className="bg-card border border-border rounded-xl shadow-2xl w-full max-w-md mx-4 overflow-hidden">
-        <div className="bg-gradient-to-br from-green-500/10 to-transparent px-6 pt-6 pb-4">
-          <div className="flex items-start justify-between gap-4">
-            <div>
-              <div className="flex items-center gap-2 mb-1">
-                <div className="h-7 w-7 rounded-full bg-green-500/20 flex items-center justify-center"><span className="text-sm">🎉</span></div>
-                <h2 className="text-lg font-bold text-foreground">Rewrites Complete!</h2>
-              </div>
-              <p className="text-sm text-muted-foreground">
-                <strong className="text-foreground">{rewriteCount}</strong> script{rewriteCount !== 1 ? 's' : ''} rewritten.
-                {hasErrors && <span className="text-amber-500 ml-1">Some videos had errors.</span>}
-              </p>
-            </div>
-            <button onClick={onDismiss} className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors shrink-0">
-              <X className="h-4 w-4" />
-            </button>
-          </div>
-        </div>
-        <div className="px-6 pb-6 pt-2 flex flex-col gap-3">
-          <button onClick={onDownload} disabled={downloading}
-            className="w-full flex items-center gap-4 p-4 rounded-xl border-2 border-primary/30 bg-primary/5 hover:border-primary hover:bg-primary/10 transition-all text-left group disabled:opacity-60 disabled:cursor-not-allowed">
-            <div className="p-2.5 rounded-lg bg-primary/15 text-primary shrink-0">
-              {downloading ? <Loader2 className="h-5 w-5 animate-spin" /> : <Download className="h-5 w-5" />}
-            </div>
-            <div className="flex-1 min-w-0">
-              <p className="font-semibold text-foreground group-hover:text-primary transition-colors">Download Rewritten Bundle</p>
-              <p className="text-xs text-muted-foreground mt-0.5">All rewritten scripts in one <code className="font-mono">.txt</code> file.</p>
-            </div>
-            <ChevronRight className="h-4 w-4 text-muted-foreground group-hover:text-primary transition-colors shrink-0" />
-          </button>
-          <button onClick={onExportRaw} disabled={exportingRaw}
-            className="w-full flex items-center gap-4 p-4 rounded-xl border border-border bg-background hover:border-primary/40 hover:bg-muted/50 transition-all text-left group disabled:opacity-60 disabled:cursor-not-allowed">
-            <div className="p-2.5 rounded-lg bg-muted text-muted-foreground shrink-0">
-              {exportingRaw ? <Loader2 className="h-5 w-5 animate-spin" /> : <FileText className="h-5 w-5" />}
-            </div>
-            <div className="flex-1 min-w-0">
-              <p className="font-semibold text-foreground">Export raw transcripts</p>
-              <p className="text-xs text-muted-foreground mt-0.5">Download originals as <code className="font-mono">.txt</code>.</p>
-            </div>
-            <ChevronRight className="h-4 w-4 text-muted-foreground group-hover:text-foreground transition-colors shrink-0" />
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ─── Rewrite Prompt Modal (with model picker) ─────────────────────────────────
-function RewritePromptModal({ transcriptCount, onSubmit, onBack, submitting }: {
+// ─── Export Format Modal (unavoidable) ───────────────────────────────────────
+// Cannot be dismissed by backdrop click or Escape — only by choosing a format
+// or explicitly pressing Cancel.
+function ExportFormatModal({ transcriptCount, jobId, onDismiss }: {
   transcriptCount: number;
-  onSubmit: (prompt: string, modelId: string) => void;
-  onBack:   () => void;
-  submitting: boolean;
+  jobId: string;
+  onDismiss: () => void;
 }) {
-  const [prompt,          setPrompt]          = useState('');
-  const [selectedModel,   setSelectedModel]   = useState(DEFAULT_MODEL);
-  const [showModelPicker, setShowModelPicker] = useState(false);
+  const [exporting, setExporting] = useState<'txt' | 'md' | null>(null);
 
-  useEffect(() => {
-    const h = (e: KeyboardEvent) => { if (e.key === 'Escape' && !submitting) onBack(); };
-    window.addEventListener('keydown', h);
-    return () => window.removeEventListener('keydown', h);
-  }, [onBack, submitting]);
-
-  const activeModel = FREE_MODELS.find(m => m.id === selectedModel) ?? FREE_MODELS[0];
-  const fallbacks   = FREE_MODELS.filter(m => m.id !== selectedModel);
+  async function handleExport(format: 'txt' | 'md') {
+    if (exporting) return;
+    setExporting(format);
+    try {
+      const res = await fetch(`/api/jobs/${jobId}/export-transcripts?format=${format}`);
+      if (!res.ok) {
+        const e = await res.json().catch(() => ({}));
+        throw new Error((e as { error?: string }).error ?? `HTTP ${res.status}`);
+      }
+      const blob = await res.blob();
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement('a');
+      a.href     = url;
+      a.download = `transcripts-${jobId.slice(0, 8)}.${format}`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      toast.success(`Transcripts downloaded as .${format}`);
+      onDismiss();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Export failed');
+    } finally {
+      setExporting(null);
+    }
+  }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-      <div className="bg-card border border-border rounded-xl shadow-2xl w-full max-w-lg mx-4">
+    // No onClick on backdrop — intentionally unavoidable
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
+      <div className="bg-card border border-border rounded-xl shadow-2xl w-full max-w-md mx-4 overflow-hidden">
 
         {/* Header */}
-        <div className="flex items-center justify-between gap-4 px-6 pt-6 pb-4">
-          <div>
-            <h2 className="text-lg font-bold text-foreground">AI Rewrite Prompt</h2>
-            <p className="text-sm text-muted-foreground mt-0.5">
-              Applied to all <strong className="text-foreground">{transcriptCount}</strong> transcript{transcriptCount !== 1 ? 's' : ''}.
-            </p>
+        <div className="bg-gradient-to-br from-green-500/10 to-transparent px-6 pt-6 pb-4">
+          <div className="flex items-center gap-3 mb-1">
+            <div className="h-8 w-8 rounded-full bg-green-500/20 flex items-center justify-center">
+              <span className="text-base">✅</span>
+            </div>
+            <h2 className="text-lg font-bold text-foreground">Transcripts Ready!</h2>
           </div>
-          <button onClick={onBack} disabled={submitting} className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors shrink-0 disabled:opacity-40">
-            <X className="h-4 w-4" />
+          <p className="text-sm text-muted-foreground pl-11">
+            <strong className="text-foreground">{transcriptCount}</strong> transcript{transcriptCount !== 1 ? 's' : ''} extracted. Choose a format to download.
+          </p>
+        </div>
+
+        {/* Format options */}
+        <div className="px-6 pt-4 pb-2 flex flex-col gap-3">
+
+          {/* .txt */}
+          <button
+            onClick={() => handleExport('txt')}
+            disabled={!!exporting}
+            className="w-full flex items-center gap-4 p-4 rounded-xl border-2 border-border bg-background hover:border-primary/60 hover:bg-primary/5 transition-all text-left group disabled:opacity-60 disabled:cursor-not-allowed"
+          >
+            <div className="p-2.5 rounded-lg bg-muted text-muted-foreground group-hover:bg-primary/15 group-hover:text-primary transition-colors shrink-0">
+              {exporting === 'txt' ? <Loader2 className="h-5 w-5 animate-spin" /> : <FileText className="h-5 w-5" />}
+            </div>
+            <div className="flex-1 min-w-0">
+              <p className="font-semibold text-foreground group-hover:text-primary transition-colors">Plain Text <code className="font-mono text-xs bg-muted px-1.5 py-0.5 rounded ml-1">.txt</code></p>
+              <p className="text-xs text-muted-foreground mt-0.5">Simple text file — easy to read anywhere, paste into any editor.</p>
+            </div>
+            <ChevronRight className="h-4 w-4 text-muted-foreground group-hover:text-primary transition-colors shrink-0" />
+          </button>
+
+          {/* .md */}
+          <button
+            onClick={() => handleExport('md')}
+            disabled={!!exporting}
+            className="w-full flex items-center gap-4 p-4 rounded-xl border-2 border-border bg-background hover:border-primary/60 hover:bg-primary/5 transition-all text-left group disabled:opacity-60 disabled:cursor-not-allowed"
+          >
+            <div className="p-2.5 rounded-lg bg-muted text-muted-foreground group-hover:bg-primary/15 group-hover:text-primary transition-colors shrink-0">
+              {exporting === 'md' ? <Loader2 className="h-5 w-5 animate-spin" /> : <FileDown className="h-5 w-5" />}
+            </div>
+            <div className="flex-1 min-w-0">
+              <p className="font-semibold text-foreground group-hover:text-primary transition-colors">Markdown <code className="font-mono text-xs bg-muted px-1.5 py-0.5 rounded ml-1">.md</code></p>
+              <p className="text-xs text-muted-foreground mt-0.5">Structured with headings, links, word counts. Great for Obsidian, Notion, or GitHub.</p>
+            </div>
+            <ChevronRight className="h-4 w-4 text-muted-foreground group-hover:text-primary transition-colors shrink-0" />
           </button>
         </div>
 
-        <div className="px-6 pb-6 space-y-4">
-          {/* Prompt textarea */}
-          <Textarea
-            autoFocus
-            placeholder="e.g. Rewrite this YouTube transcript as a clean, engaging blog post. Remove filler words and timestamps."
-            value={prompt}
-            onChange={e => setPrompt(e.target.value)}
-            rows={5}
-            className="resize-none"
-            disabled={submitting}
-          />
-
-          {/* Model picker */}
-          <div className="rounded-lg border border-border bg-secondary/20 p-3 space-y-2">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">AI Model</span>
-              <button
-                type="button"
-                onClick={() => setShowModelPicker(v => !v)}
-                disabled={submitting}
-                className="flex items-center gap-1.5 text-xs text-primary hover:underline disabled:opacity-40"
-              >
-                Change <ChevronDown className={`h-3 w-3 transition-transform ${showModelPicker ? 'rotate-180' : ''}`} />
-              </button>
-            </div>
-
-            {/* Current selection summary */}
-            <div className="flex items-start gap-2">
-              <div className="h-2 w-2 rounded-full bg-green-400 mt-1.5 shrink-0" />
-              <div>
-                <p className="text-sm font-medium text-foreground">{activeModel.label}</p>
-                <p className="text-xs text-muted-foreground">{activeModel.description}</p>
-              </div>
-            </div>
-
-            {/* Fallback chain preview */}
-            {!showModelPicker && (
-              <div className="flex items-center gap-1.5 flex-wrap">
-                <span className="text-xs text-muted-foreground">Fallbacks:</span>
-                {fallbacks.map((m, i) => (
-                  <span key={m.id} className="text-xs bg-muted text-muted-foreground rounded px-1.5 py-0.5">
-                    {i + 1}. {m.label}
-                  </span>
-                ))}
-              </div>
-            )}
-
-            {/* Expanded model picker */}
-            {showModelPicker && (
-              <div className="space-y-1.5 pt-1">
-                {FREE_MODELS.map(m => (
-                  <button
-                    key={m.id}
-                    type="button"
-                    onClick={() => { setSelectedModel(m.id); setShowModelPicker(false); }}
-                    disabled={submitting}
-                    className={`w-full flex items-start gap-3 p-2.5 rounded-lg border text-left transition-all disabled:opacity-40
-                      ${ selectedModel === m.id
-                        ? 'border-primary/60 bg-primary/10 text-foreground'
-                        : 'border-border bg-background hover:border-primary/30 hover:bg-muted/50 text-muted-foreground hover:text-foreground'
-                      }`
-                    }
-                  >
-                    <div className={`h-2 w-2 rounded-full mt-1.5 shrink-0 ${ selectedModel === m.id ? 'bg-green-400' : 'bg-muted-foreground/40' }`} />
-                    <div>
-                      <p className="text-sm font-medium">
-                        {m.label}
-                        {m.default && <span className="ml-1.5 text-xs text-muted-foreground">(default)</span>}
-                      </p>
-                      <p className="text-xs opacity-70 mt-0.5">{m.description}</p>
-                      <p className="text-xs font-mono opacity-40 mt-0.5">{m.id}</p>
-                    </div>
-                  </button>
-                ))}
-                <p className="text-xs text-muted-foreground pt-1">
-                  On 429 rate-limit the other two models are tried automatically as fallbacks.
-                </p>
-              </div>
-            )}
-          </div>
-
-          {/* Actions */}
-          <div className="flex items-center gap-3 justify-end">
-            <Button variant="outline" onClick={onBack} disabled={submitting}>← Back</Button>
-            <Button onClick={() => onSubmit(prompt, selectedModel)} disabled={submitting || !prompt.trim()}>
-              {submitting
-                ? <><Loader2 className="h-4 w-4 animate-spin mr-2" />Submitting…</>
-                : <><Sparkles className="h-4 w-4 mr-2" />Rewrite {transcriptCount} transcript{transcriptCount !== 1 ? 's' : ''}</>
-              }
-            </Button>
-          </div>
+        {/* Cancel — only dismissal path */}
+        <div className="px-6 pb-6 pt-2">
+          <button
+            onClick={onDismiss}
+            disabled={!!exporting}
+            className="w-full py-2.5 rounded-lg text-sm text-muted-foreground hover:text-foreground hover:bg-muted transition-colors disabled:opacity-40"
+          >
+            Cancel — I&apos;ll download later
+          </button>
         </div>
       </div>
     </div>
@@ -389,39 +219,20 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
   const [job,      setJob]      = useState<Job>(initialJob);
   const [videos,   setVideos]   = useState<JobVideo[]>(initialVideos);
   const [hydrated, setHydrated] = useState(initialVideos.length > 0);
-  const [modal,    setModal]    = useState<ModalState>('none');
+  const [showExportModal, setShowExportModal] = useState(false);
 
   const statusRef           = useRef<string>('');
-  const modalRef            = useRef<ModalState>('none');
-  const txModalShownRef     = useRef<boolean>(false);
   const exportModalShownRef = useRef<boolean>(false);
   const pumpRunningRef      = useRef<Record<string, boolean>>({});
   const jobIdRef            = useRef<string>(initialJob.id as string);
 
-  const setModalSafe = (m: ModalState) => { modalRef.current = m; setModal(m); };
-
-  const [isProcessing,     setIsProcessing]     = useState(ACTIVE_STATUSES.has(initialJob.status as string));
-  const [submittingPrompt, setSubmittingPrompt] = useState(false);
-  const [downloading,      setDownloading]      = useState(false);
-  const [exportingRaw,     setExportingRaw]     = useState(false);
-  const [cancelling,       setCancelling]       = useState(false);
-  const [deleting,         setDeleting]         = useState(false);
-  const [viewingVideo,     setViewingVideo]     = useState<JobVideo | null>(null);
+  const [isProcessing, setIsProcessing] = useState(ACTIVE_STATUSES.has(initialJob.status as string));
+  const [exportingTxt, setExportingTxt] = useState(false);
+  const [cancelling,   setCancelling]   = useState(false);
+  const [deleting,     setDeleting]     = useState(false);
+  const [viewingVideo, setViewingVideo] = useState<JobVideo | null>(null);
 
   const jobId = initialJob.id as string;
-
-  function triggerModalForTransition(oldStatus: string, newStatus: string) {
-    if (oldStatus === newStatus) return;
-    if (!MODAL_TRIGGER_STATUSES.has(newStatus)) return;
-    if (newStatus === 'awaiting_prompt' && !txModalShownRef.current) {
-      txModalShownRef.current = true;
-      setModalSafe('transcript_complete');
-    }
-    if ((newStatus === 'completed' || newStatus === 'completed_with_errors') && !exportModalShownRef.current) {
-      exportModalShownRef.current = true;
-      setModalSafe('export_ready');
-    }
-  }
 
   async function kickPump(endpoint: string) {
     if (pumpRunningRef.current[endpoint]) return;
@@ -431,8 +242,7 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
       while (true) {
         const s = statusRef.current;
         if (TERMINAL_STATUSES.has(s)) break;
-        if (endpoint.includes('extract') && s !== 'extracting')                               break;
-        if (endpoint.includes('rewrite') && !['rewriting','queued_for_rewrite'].includes(s)) break;
+        if (endpoint.includes('extract') && s !== 'extracting') break;
 
         let data: { success: boolean; data?: { remaining?: number; advanced?: boolean; waiting?: boolean } } | null = null;
         try {
@@ -454,14 +264,7 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
     }
   }
 
-  // ── FIX: kick pump for 'discovering' → 'extracting' transition ──────────────
-  // When the job page first loads with status 'discovering', the discover API
-  // call was already fired by jobs/new. Once it transitions to 'extracting',
-  // the tick() below catches it and kicks the extract pump. However if the page
-  // loads AFTER discover already finished (race), the initial status check below
-  // handles it. This useEffect also catches a page reload mid-discovery.
   useEffect(() => {
-    txModalShownRef.current     = false;
     exportModalShownRef.current = false;
     statusRef.current = '';
 
@@ -478,14 +281,15 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
         statusRef.current = newStatus;
         setJob(jobData as Job);
         setIsProcessing(ACTIVE_STATUSES.has(newStatus));
-        triggerModalForTransition(oldStatus, newStatus);
 
-        // Kick pumps on status transitions AND on initial load (oldStatus === '')
-        // FIX: added 'extracting' kick on initial load so a page-reload mid-extract
-        // correctly resumes the pump loop without needing a status change.
+        // Show export modal when transcripts are all done
+        if (newStatus === 'awaiting_prompt' && !exportModalShownRef.current) {
+          exportModalShownRef.current = true;
+          setShowExportModal(true);
+        }
+
         if (newStatus !== oldStatus || oldStatus === '') {
-          if (newStatus === 'extracting')                                       kickPump('/api/worker/pump/extract');
-          if (newStatus === 'rewriting' || newStatus === 'queued_for_rewrite') kickPump('/api/worker/pump/rewrite');
+          if (newStatus === 'extracting') kickPump('/api/worker/pump/extract');
         }
 
         const { data: videosData } = await supabase
@@ -494,12 +298,14 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
       } catch { /* ignore transient errors */ }
     };
 
-    // FIX: kick pumps immediately based on initial job status so a hard-refresh
-    // mid-job doesn't leave the pipeline stalled waiting for a status *change*.
     const s0 = initialJob.status as string;
     statusRef.current = s0;
-    if (s0 === 'extracting')                                kickPump('/api/worker/pump/extract');
-    if (s0 === 'rewriting' || s0 === 'queued_for_rewrite') kickPump('/api/worker/pump/rewrite');
+    if (s0 === 'extracting') kickPump('/api/worker/pump/extract');
+    // If page loads on a completed job, show modal if not yet dismissed
+    if (s0 === 'awaiting_prompt' && !exportModalShownRef.current) {
+      exportModalShownRef.current = true;
+      setShowExportModal(true);
+    }
 
     tick();
     const interval = setInterval(tick, 2000);
@@ -525,64 +331,26 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobId]);
 
-  // ── Action handlers ───────────────────────────────────────────────────────
-  const handleSubmitPrompt = async (promptText: string, modelId: string) => {
-    setSubmittingPrompt(true);
+  // ── Export handlers ───────────────────────────────────────────────────────
+  async function handleExport(format: 'txt' | 'md') {
+    if (exportingTxt) return;
+    setExportingTxt(true);
     try {
-      const res  = await fetch(`/api/jobs/${jobId}/prompt`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ master_prompt: promptText, ai_model: modelId }),
-      });
-      const data = await res.json();
-      if (!data.success) throw new Error((data.error as string) ?? 'Unknown error');
-      toast.success(`Queued ${data.data.queued_count as number} video${(data.data.queued_count as number) !== 1 ? 's' : ''} for rewriting with ${data.data.ai_model as string}`);
-      setModalSafe('none');
-      statusRef.current = 'queued_for_rewrite';
-      setIsProcessing(true);
-      setJob(prev => ({ ...prev, status: 'queued_for_rewrite' }));
-      kickPump('/api/worker/pump/rewrite');
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to submit prompt');
-    } finally {
-      setSubmittingPrompt(false);
-    }
-  };
-
-  const handleExportRaw = async () => {
-    if (exportingRaw) return;
-    setExportingRaw(true);
-    setModalSafe('none');
-    try {
-      const res = await fetch(`/api/jobs/${jobId}/export-transcripts`);
+      const res = await fetch(`/api/jobs/${jobId}/export-transcripts?format=${format}`);
       if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error((e as { error?: string }).error ?? `HTTP ${res.status}`); }
       const blob = await res.blob();
       const url  = URL.createObjectURL(blob);
       const a    = document.createElement('a');
-      a.href = url; a.download = `transcripts-${jobId.slice(0, 8)}.txt`;
+      a.href = url; a.download = `transcripts-${jobId.slice(0, 8)}.${format}`;
       document.body.appendChild(a); a.click(); document.body.removeChild(a);
       URL.revokeObjectURL(url);
-      toast.success('Transcripts downloaded');
+      toast.success(`Transcripts downloaded as .${format}`);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Export failed');
     } finally {
-      setExportingRaw(false);
+      setExportingTxt(false);
     }
-  };
-
-  const handleDownloadRewritten = async () => {
-    setDownloading(true);
-    try {
-      const res  = await fetch(`/api/jobs/${jobId}/download`);
-      const data = await res.json();
-      if (!data.success) throw new Error((data.error as string) ?? 'Unknown error');
-      window.open(data.data.url as string, '_blank');
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Download failed');
-    } finally {
-      setDownloading(false);
-    }
-  };
+  }
 
   const handleCancel = async () => {
     if (!confirm('Cancel this job? This cannot be undone.')) return;
@@ -595,7 +363,7 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
       statusRef.current = 'cancelled';
       setIsProcessing(false);
       setJob(prev => ({ ...prev, status: 'cancelled' }));
-      setModalSafe('none');
+      setShowExportModal(false);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Failed to cancel');
     } finally {
@@ -619,69 +387,37 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
   };
 
   // ── Derived ───────────────────────────────────────────────────────────────
-  const status         = job.status as string;
+  const status        = job.status as string;
   const transcriptDone = videos.filter(v => v.transcript_status === 'done').length;
-  const rewriteDone    = videos.filter(v => v.rewrite_status    === 'done').length;
-  const totalVideos    = hydrated ? videos.length : ((job.total_video_count as number) || 0);
-  const isCancellable  = CANCELLABLE_STATUSES.includes(status);
-  const isActive       = ACTIVE_STATUSES.has(status);
+  const totalVideos   = hydrated ? videos.length : ((job.total_video_count as number) || 0);
+  const isCancellable = CANCELLABLE_STATUSES.includes(status);
+  const isActive      = ACTIVE_STATUSES.has(status);
 
-  const showFAB =
-    (status === 'awaiting_prompt' && modal === 'none') ||
-    ((status === 'completed' || status === 'completed_with_errors') && modal === 'none');
-
-  const handleFABClick = () => {
-    if (status === 'awaiting_prompt') {
-      txModalShownRef.current = false;
-      triggerModalForTransition('', 'awaiting_prompt');
-    } else if (status === 'completed' || status === 'completed_with_errors') {
-      exportModalShownRef.current = false;
-      triggerModalForTransition('', status);
-    }
-  };
+  const showFAB = status === 'awaiting_prompt' && !showExportModal;
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
     <>
       {viewingVideo && <TranscriptModal jobId={jobId} video={viewingVideo} onClose={() => setViewingVideo(null)} />}
 
-      {modal === 'transcript_complete' && (
-        <TranscriptCompleteModal
+      {showExportModal && (
+        <ExportFormatModal
           transcriptCount={transcriptDone}
-          onRewrite={() => setModalSafe('prompt')}
-          onExportRaw={handleExportRaw}
-          onDismiss={() => setModalSafe('none')}
-          exportingRaw={exportingRaw}
+          jobId={jobId}
+          onDismiss={() => setShowExportModal(false)}
         />
       )}
 
-      {modal === 'prompt' && (
-        <RewritePromptModal
-          transcriptCount={transcriptDone}
-          onSubmit={handleSubmitPrompt}
-          onBack={() => setModalSafe('transcript_complete')}
-          submitting={submittingPrompt}
-        />
-      )}
-
-      {modal === 'export_ready' && (
-        <ExportReadyModal
-          rewriteCount={rewriteDone}
-          hasErrors={status === 'completed_with_errors'}
-          onDownload={handleDownloadRewritten}
-          onExportRaw={handleExportRaw}
-          onDismiss={() => setModalSafe('none')}
-          downloading={downloading}
-          exportingRaw={exportingRaw}
-        />
-      )}
-
+      {/* FAB — reopens export modal if dismissed */}
       {showFAB && (
         <div className="fixed bottom-6 right-6 z-40">
-          <button onClick={handleFABClick} title="Open next step"
-            className="flex items-center gap-2.5 h-12 px-5 rounded-full shadow-xl border border-primary/40 bg-primary text-primary-foreground font-semibold text-sm hover:bg-primary/90 active:scale-95 transition-all">
-            <span>Progress</span>
-            <ChevronRight className="h-4 w-4" />
+          <button
+            onClick={() => setShowExportModal(true)}
+            title="Download transcripts"
+            className="flex items-center gap-2.5 h-12 px-5 rounded-full shadow-xl border border-primary/40 bg-primary text-primary-foreground font-semibold text-sm hover:bg-primary/90 active:scale-95 transition-all"
+          >
+            <Download className="h-4 w-4" />
+            <span>Download</span>
           </button>
         </div>
       )}
@@ -719,7 +455,7 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
           </div>
 
           {/* Stats */}
-          <div className="grid grid-cols-3 gap-4 mb-8">
+          <div className="grid grid-cols-2 gap-4 mb-8">
             <div className="bg-card border border-border rounded-xl p-5">
               <div className="text-3xl font-bold">{hydrated ? videos.length : <Loader2 className="h-5 w-5 animate-spin inline text-muted-foreground" />}</div>
               <div className="text-sm text-muted-foreground mt-1 font-medium">Videos</div>
@@ -728,13 +464,28 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
               <div className="text-3xl font-bold">{transcriptDone}<span className="text-muted-foreground font-normal text-lg"> / {totalVideos}</span></div>
               <div className="text-sm text-muted-foreground mt-1 font-medium">Transcripts</div>
             </div>
-            <div className="bg-card border border-border rounded-xl p-5">
-              <div className="text-3xl font-bold">{rewriteDone}<span className="text-muted-foreground font-normal text-lg"> / {totalVideos}</span></div>
-              <div className="text-sm text-muted-foreground mt-1 font-medium">Rewritten</div>
-            </div>
           </div>
 
           {/* Status banners */}
+          {status === 'awaiting_prompt' && (
+            <div className="bg-gradient-to-r from-green-500/10 to-transparent border border-green-500/30 rounded-xl p-5 mb-6 flex items-center justify-between gap-4">
+              <div>
+                <p className="font-semibold">✅ All transcripts extracted</p>
+                <p className="text-sm text-muted-foreground mt-0.5">
+                  {transcriptDone} transcript{transcriptDone !== 1 ? 's' : ''} ready to download.
+                </p>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <Button size="sm" onClick={() => handleExport('txt')} disabled={exportingTxt}>
+                  {exportingTxt ? <><Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />Preparing…</> : <><Download className="h-3.5 w-3.5 mr-1.5" />.txt</>}
+                </Button>
+                <Button size="sm" variant="outline" onClick={() => handleExport('md')} disabled={exportingTxt}>
+                  {exportingTxt ? 'Preparing…' : '.md'}
+                </Button>
+              </div>
+            </div>
+          )}
+
           {status === 'cancelled' && (
             <div className="bg-muted/40 border border-border rounded-xl p-5 mb-6">
               <p className="font-semibold">Job cancelled</p>
@@ -742,30 +493,15 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
                 {transcriptDone > 0 ? `${transcriptDone} transcript(s) extracted before cancellation.` : 'No transcripts were extracted.'}
               </p>
               {transcriptDone > 0 && (
-                <Button size="sm" variant="outline" className="mt-3" onClick={handleExportRaw} disabled={exportingRaw}>
-                  {exportingRaw ? <><Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />Preparing…</> : <><Download className="h-3.5 w-3.5 mr-1.5" />Export transcripts</>}
-                </Button>
+                <div className="flex gap-2 mt-3">
+                  <Button size="sm" variant="outline" onClick={() => handleExport('txt')} disabled={exportingTxt}>
+                    {exportingTxt ? <><Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />Preparing…</> : <><Download className="h-3.5 w-3.5 mr-1.5" />Export .txt</>}
+                  </Button>
+                  <Button size="sm" variant="outline" onClick={() => handleExport('md')} disabled={exportingTxt}>
+                    Export .md
+                  </Button>
+                </div>
               )}
-            </div>
-          )}
-
-          {(status === 'completed' || status === 'completed_with_errors') && (
-            <div className="bg-gradient-to-r from-green-500/10 to-transparent border border-green-500/30 rounded-xl p-5 mb-6 flex items-center justify-between gap-4">
-              <div>
-                <p className="font-semibold">🎉 Rewrites ready to export</p>
-                <p className="text-sm text-muted-foreground mt-0.5">
-                  {rewriteDone} script{rewriteDone !== 1 ? 's' : ''} done.
-                  {status === 'completed_with_errors' && <span className="text-amber-500 ml-1">Some videos had errors.</span>}
-                </p>
-              </div>
-              <div className="flex items-center gap-2 shrink-0">
-                <Button size="sm" onClick={handleDownloadRewritten} disabled={downloading}>
-                  {downloading ? <><Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />Generating…</> : <><Download className="h-3.5 w-3.5 mr-1.5" />Download</>}
-                </Button>
-                <Button size="sm" variant="outline" onClick={handleExportRaw} disabled={exportingRaw}>
-                  {exportingRaw ? 'Preparing…' : 'Raw .txt'}
-                </Button>
-              </div>
             </div>
           )}
 
@@ -774,9 +510,14 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
               <p className="text-red-400 font-semibold flex items-center gap-2"><AlertTriangle className="h-4 w-4" />Job failed</p>
               <p className="text-sm text-muted-foreground mt-1">{(job.error_message as string) || 'An unknown error occurred.'}</p>
               {transcriptDone > 0 && (
-                <Button size="sm" variant="outline" className="mt-3" onClick={handleExportRaw} disabled={exportingRaw}>
-                  {exportingRaw ? 'Preparing…' : <><Download className="h-3.5 w-3.5 mr-1.5" />Export transcripts anyway</>}
-                </Button>
+                <div className="flex gap-2 mt-3">
+                  <Button size="sm" variant="outline" onClick={() => handleExport('txt')} disabled={exportingTxt}>
+                    {exportingTxt ? 'Preparing…' : <><Download className="h-3.5 w-3.5 mr-1.5" />Export .txt anyway</>}
+                  </Button>
+                  <Button size="sm" variant="outline" onClick={() => handleExport('md')} disabled={exportingTxt}>
+                    Export .md
+                  </Button>
+                </div>
               )}
             </div>
           )}
@@ -792,10 +533,8 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
             <div className="divide-y divide-border">
               {videos.map((video, index) => {
                 const tStatus = video.transcript_status as string;
-                const rStatus = video.rewrite_status   as string;
                 const hasTx   = tStatus === 'done';
                 const txError = video.transcript_error as string | null;
-                const rwError = video.rewrite_error    as string | null;
                 return (
                   <div key={video.id as string} className="flex items-center gap-3 px-5 py-3 group hover:bg-muted/30 transition-colors">
                     <span className="text-muted-foreground text-xs w-6 text-right shrink-0 font-mono">{index + 1}</span>
@@ -805,17 +544,11 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
                         <p className="text-xs text-muted-foreground mt-0.5">{(video.transcript_word_count as number).toLocaleString()} words</p>
                       )}
                       {tStatus === 'failed' && txError && <p className="text-xs text-red-400 mt-0.5 truncate" title={txError}>{txError}</p>}
-                      {rStatus === 'failed' && rwError && <p className="text-xs text-red-400 mt-0.5 truncate" title={rwError}>{rwError}</p>}
                     </div>
                     <div className="flex items-center gap-2 shrink-0">
                       <Badge variant={TRANSCRIPT_VARIANTS[tStatus] ?? 'secondary'} className="text-xs">
                         {tStatus === 'done' ? '✓ Transcript' : tStatus === 'failed' ? '✗ Failed' : tStatus === 'skipped' ? '— Skipped' : tStatus === 'processing' ? 'Extracting…' : 'Pending'}
                       </Badge>
-                      {rStatus && rStatus !== 'not_started' && (
-                        <Badge variant={REWRITE_VARIANTS[rStatus] ?? 'secondary'} className="text-xs">
-                          {rStatus === 'done' ? '✓ Rewritten' : rStatus === 'failed' ? '✗ Failed' : rStatus === 'processing' ? 'Rewriting…' : rStatus === 'queued' ? 'Queued' : rStatus}
-                        </Badge>
-                      )}
                       {hasTx && (
                         <button onClick={() => setViewingVideo(video)} title="View transcript"
                           className="p-1.5 rounded-lg text-muted-foreground hover:text-primary hover:bg-primary/10 transition-colors opacity-0 group-hover:opacity-100 focus:opacity-100">

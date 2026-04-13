@@ -4,15 +4,18 @@ import { createAdminClient } from '@/lib/supabase/admin';
 import type { ApiResponse } from '@/types';
 
 /**
- * GET /api/jobs/[id]/export-transcripts
- * Streams back a single .txt file with all raw transcripts bundled,
- * separated by video title headings and dividers.
+ * GET /api/jobs/[id]/export-transcripts?format=txt|md
+ *
+ * format=txt (default): plain text bundle, one file per video separated by dividers.
+ * format=md: Markdown bundle — each video gets a # heading, video URL link,
+ *            word count, and transcript under a ## Transcript heading.
  */
 export async function GET(
-  _req: NextRequest,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
+  const format = (req.nextUrl.searchParams.get('format') ?? 'txt') as 'txt' | 'md';
 
   const supabase = await createClient();
   const { data: { user } } = await supabase.auth.getUser();
@@ -46,59 +49,101 @@ export async function GET(
     );
   }
 
-  const lines: string[] = [
-    `YT Rewriter — Raw Transcript Export`,
-    `Source : ${(job.source_name as string | null) ?? (job.source_url as string)}`,
-    `URL    : ${job.source_url as string}`,
-    `Videos : ${videos.length}`,
-    `Date   : ${new Date().toUTCString()}`,
-    '',
-    '='.repeat(80),
-    '',
-  ];
-
-  for (let i = 0; i < videos.length; i++) {
-    const v     = videos[i];
-    const title = (v.video_title as string | null) ?? (v.video_id as string);
-    const words = v.transcript_word_count
-      ? ` (${(v.transcript_word_count as number).toLocaleString()} words)`
-      : '';
-
-    lines.push(
-      `[${i + 1}] ${title}${words}`,
-      `    https://www.youtube.com/watch?v=${v.video_id as string}`,
-      ''
-    );
-
-    // transcript_storage_path = "transcripts/{job_id}/{video_id}/transcript.txt"
-    // storage.from('transcripts').download() needs path WITHOUT "transcripts/" prefix
-    const storagePath = v.transcript_storage_path as string;
+  // Helper to download a single transcript text from Supabase storage
+  async function fetchTranscriptText(storagePath: string): Promise<string> {
     const downloadPath = storagePath.startsWith('transcripts/')
       ? storagePath.slice('transcripts/'.length)
       : storagePath;
-
     const { data: fileData, error: dlErr } = await admin
       .storage
       .from('transcripts')
       .download(downloadPath);
-
-    if (dlErr || !fileData) {
-      lines.push('(transcript content unavailable)');
-    } else {
-      const text = await fileData.text();
-      lines.push(text.trim());
-    }
-
-    lines.push('', '-'.repeat(80), '');
+    if (dlErr || !fileData) return '(transcript content unavailable)';
+    return (await fileData.text()).trim();
   }
 
-  const bundle   = lines.join('\n');
-  const filename = `transcripts-${id.slice(0, 8)}.txt`;
+  let bundle: string;
+  let filename: string;
+  let contentType: string;
+
+  if (format === 'md') {
+    // ─── Markdown format ───
+    const sourceName = (job.source_name as string | null) ?? (job.source_url as string);
+    const lines: string[] = [
+      `# Transcripts: ${sourceName}`,
+      ``,
+      `> **Source:** [${job.source_url as string}](${job.source_url as string})  `,
+      `> **Videos:** ${videos.length}  `,
+      `> **Exported:** ${new Date().toUTCString()}`,
+      ``,
+      `---`,
+      ``,
+    ];
+
+    for (let i = 0; i < videos.length; i++) {
+      const v     = videos[i];
+      const title = (v.video_title as string | null) ?? (v.video_id as string);
+      const words = v.transcript_word_count
+        ? `${(v.transcript_word_count as number).toLocaleString()} words`
+        : null;
+      const videoUrl = `https://www.youtube.com/watch?v=${v.video_id as string}`;
+
+      lines.push(
+        `## ${i + 1}. ${title}`,
+        ``,
+        `**URL:** [${videoUrl}](${videoUrl})${ words ? `  ` : `` }`,
+        ...(words ? [`**Words:** ${words}`, ``] : [``]),
+        `### Transcript`,
+        ``,
+      );
+
+      const text = await fetchTranscriptText(v.transcript_storage_path as string);
+      lines.push(text, ``, `---`, ``);
+    }
+
+    bundle      = lines.join('\n');
+    filename    = `transcripts-${id.slice(0, 8)}.md`;
+    contentType = 'text/markdown; charset=utf-8';
+
+  } else {
+    // ─── Plain text format (default) ───
+    const lines: string[] = [
+      `YT Rewriter — Raw Transcript Export`,
+      `Source : ${(job.source_name as string | null) ?? (job.source_url as string)}`,
+      `URL    : ${job.source_url as string}`,
+      `Videos : ${videos.length}`,
+      `Date   : ${new Date().toUTCString()}`,
+      ``,
+      `${'='.repeat(80)}`,
+      ``,
+    ];
+
+    for (let i = 0; i < videos.length; i++) {
+      const v     = videos[i];
+      const title = (v.video_title as string | null) ?? (v.video_id as string);
+      const words = v.transcript_word_count
+        ? ` (${(v.transcript_word_count as number).toLocaleString()} words)`
+        : '';
+
+      lines.push(
+        `[${i + 1}] ${title}${words}`,
+        `    https://www.youtube.com/watch?v=${v.video_id as string}`,
+        ``,
+      );
+
+      const text = await fetchTranscriptText(v.transcript_storage_path as string);
+      lines.push(text, ``, `${'-'.repeat(80)}`, ``);
+    }
+
+    bundle      = lines.join('\n');
+    filename    = `transcripts-${id.slice(0, 8)}.txt`;
+    contentType = 'text/plain; charset=utf-8';
+  }
 
   return new NextResponse(bundle, {
     status: 200,
     headers: {
-      'Content-Type':        'text/plain; charset=utf-8',
+      'Content-Type':        contentType,
       'Content-Disposition': `attachment; filename="${filename}"`,
       'Content-Length':      String(Buffer.byteLength(bundle, 'utf8')),
     },

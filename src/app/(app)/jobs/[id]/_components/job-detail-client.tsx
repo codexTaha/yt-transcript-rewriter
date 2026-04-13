@@ -454,6 +454,12 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
     }
   }
 
+  // ── FIX: kick pump for 'discovering' → 'extracting' transition ──────────────
+  // When the job page first loads with status 'discovering', the discover API
+  // call was already fired by jobs/new. Once it transitions to 'extracting',
+  // the tick() below catches it and kicks the extract pump. However if the page
+  // loads AFTER discover already finished (race), the initial status check below
+  // handles it. This useEffect also catches a page reload mid-discovery.
   useEffect(() => {
     txModalShownRef.current     = false;
     exportModalShownRef.current = false;
@@ -473,17 +479,25 @@ export function JobDetailClient({ job: initialJob, initialVideos }: { job: Job; 
         setJob(jobData as Job);
         setIsProcessing(ACTIVE_STATUSES.has(newStatus));
         triggerModalForTransition(oldStatus, newStatus);
-        if (newStatus !== oldStatus) {
-          if (newStatus === 'extracting')                                      kickPump('/api/worker/pump/extract');
+
+        // Kick pumps on status transitions AND on initial load (oldStatus === '')
+        // FIX: added 'extracting' kick on initial load so a page-reload mid-extract
+        // correctly resumes the pump loop without needing a status change.
+        if (newStatus !== oldStatus || oldStatus === '') {
+          if (newStatus === 'extracting')                                       kickPump('/api/worker/pump/extract');
           if (newStatus === 'rewriting' || newStatus === 'queued_for_rewrite') kickPump('/api/worker/pump/rewrite');
         }
+
         const { data: videosData } = await supabase
           .from('job_videos').select('*').eq('job_id', jobId).order('discovery_position', { ascending: true });
         if (!destroyed && videosData) { setVideos(videosData as JobVideo[]); setHydrated(true); }
       } catch { /* ignore transient errors */ }
     };
 
+    // FIX: kick pumps immediately based on initial job status so a hard-refresh
+    // mid-job doesn't leave the pipeline stalled waiting for a status *change*.
     const s0 = initialJob.status as string;
+    statusRef.current = s0;
     if (s0 === 'extracting')                                kickPump('/api/worker/pump/extract');
     if (s0 === 'rewriting' || s0 === 'queued_for_rewrite') kickPump('/api/worker/pump/rewrite');
 

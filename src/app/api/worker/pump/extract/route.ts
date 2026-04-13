@@ -11,6 +11,30 @@ const MAX_RETRIES = 3;
 // we assume the worker crashed and reset it back to 'pending'.
 const PROCESSING_STALE_MS = 90_000; // 90 seconds
 
+/**
+ * Resolve the base URL for internal self-calls.
+ *
+ * Priority:
+ *   1. NEXT_PUBLIC_APP_URL env var  (set this in .env.local for local dev)
+ *   2. NEXTAUTH_URL / VERCEL_URL    (common CI/hosting vars)
+ *   3. http://localhost:3000         (hardcoded local fallback)
+ *
+ * WHY: process.env.NEXT_PUBLIC_APP_URL is often missing locally, causing
+ * fire-and-forget fetch() calls to the extract worker to silently fail
+ * because the URL resolves to undefined/null or a broken string.
+ */
+function resolveBaseUrl(): string {
+  const candidates = [
+    process.env.NEXT_PUBLIC_APP_URL,
+    process.env.NEXTAUTH_URL,
+    process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : undefined,
+  ];
+  for (const c of candidates) {
+    if (c && c.trim() && c.trim() !== 'undefined') return c.trim().replace(/\/$/, '');
+  }
+  return 'http://localhost:3000';
+}
+
 export async function POST(req: NextRequest) {
   const admin = createAdminClient();
 
@@ -39,9 +63,6 @@ export async function POST(req: NextRequest) {
     }
 
     // --- Unstick stale 'processing' rows ---
-    // If a worker crashed after marking status='processing' but before
-    // writing 'done'/'failed', the pump would be blocked forever.
-    // Reset any row that has been 'processing' for over PROCESSING_STALE_MS.
     const staleThreshold = new Date(Date.now() - PROCESSING_STALE_MS).toISOString();
     await admin
       .from('job_videos')
@@ -83,7 +104,10 @@ export async function POST(req: NextRequest) {
 
       const nextStatus = success === 0 ? 'failed' : 'awaiting_prompt';
       const errorMsg   = success === 0
-        ? `All ${failed} transcript extractions failed. Try setting YOUTUBE_COOKIES_FILE in .env.local.`
+        ? `All ${failed} transcript extractions failed. ` +
+          'Check: (1) YOUTUBE_COOKIES_FILE is set in .env.local, ' +
+          '(2) youtube-transcript-api is installed in your venv, ' +
+          '(3) PYTHON_BIN points to your venv Python.'
         : undefined;
 
       await admin
@@ -138,7 +162,8 @@ export async function POST(req: NextRequest) {
       })
       .in('id', batch.map(v => v.id));
 
-    const baseUrl = process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000';
+    const baseUrl = resolveBaseUrl();
+    console.log(`[pump/extract] dispatching ${batch.length} videos via ${baseUrl}`);
 
     // Fire-and-forget — results are written to DB by the extract worker
     batch.forEach(video => {
@@ -146,7 +171,9 @@ export async function POST(req: NextRequest) {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ job_id, job_video_id: video.id, video_id: video.video_id }),
-      }).catch(() => {});
+      }).catch((err) => {
+        console.error(`[pump/extract] fire-and-forget failed for ${video.video_id}:`, err);
+      });
     });
 
     const { count: pendingAfter } = await admin

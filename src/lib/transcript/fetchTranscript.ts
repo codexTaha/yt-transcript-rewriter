@@ -10,15 +10,46 @@
  * For local dev without a proxy, export cookies.txt from your browser:
  *   Chrome/Firefox extension: "Get cookies.txt LOCALLY" or "Cookie-Editor"
  *   Then set: YOUTUBE_COOKIES_FILE=/absolute/path/to/cookies.txt
+ *
+ * PYTHON RESOLUTION ORDER (fix for venv isolation):
+ *   1. PYTHON_BIN env var  -> explicit path e.g. /home/taha/venv/bin/python3
+ *   2. <cwd>/venv/bin/python3 (Linux/Mac) or <cwd>/venv/Scripts/python.exe (Windows)
+ *   3. python3 / python     -> system fallback
  */
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
+import fs from 'fs';
 
 const execFileAsync = promisify(execFile);
 
 const SCRIPT_PATH = path.join(process.cwd(), 'scripts', 'fetch_transcript.py');
-const PYTHON = process.platform === 'win32' ? 'python' : 'python3';
+
+/**
+ * Resolve the Python executable to use, preferring the project venv.
+ * Priority:
+ *   1. PYTHON_BIN env var (absolute path)
+ *   2. <project-root>/venv/bin/python3  (Linux/Mac venv)
+ *   3. <project-root>/venv/Scripts/python.exe  (Windows venv)
+ *   4. python3  (system, Linux/Mac)
+ *   5. python   (system, Windows fallback)
+ */
+function resolvePython(): string {
+  // 1. Explicit override
+  const explicit = process.env.PYTHON_BIN?.trim();
+  if (explicit) return explicit;
+
+  // 2. Project-local venv (Linux/Mac)
+  const venvUnix = path.join(process.cwd(), 'venv', 'bin', 'python3');
+  if (fs.existsSync(venvUnix)) return venvUnix;
+
+  // 3. Project-local venv (Windows)
+  const venvWin = path.join(process.cwd(), 'venv', 'Scripts', 'python.exe');
+  if (fs.existsSync(venvWin)) return venvWin;
+
+  // 4/5. System Python
+  return process.platform === 'win32' ? 'python' : 'python3';
+}
 
 export interface TranscriptResult {
   text: string;
@@ -33,13 +64,15 @@ export async function fetchTranscript(
   videoId: string,
   timeoutMs = 60_000   // raised to 60s to handle slow proxy retries
 ): Promise<TranscriptResult> {
+  const PYTHON = resolvePython();
+
   const authMode =
     process.env.YOUTUBE_COOKIES_FILE                ? `cookies:${process.env.YOUTUBE_COOKIES_FILE}` :
     process.env.WEBSHARE_PROXY_USERNAME             ? 'webshare' :
     process.env.PROXY_URL                           ? `proxy:${process.env.PROXY_URL}` :
                                                       'direct';
 
-  console.log(`[fetchTranscript] video=${videoId} auth=${authMode}`);
+  console.log(`[fetchTranscript] video=${videoId} auth=${authMode} python=${PYTHON}`);
 
   // Forward all relevant env vars explicitly to the subprocess
   const env: NodeJS.ProcessEnv = {

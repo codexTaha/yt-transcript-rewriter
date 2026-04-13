@@ -6,7 +6,9 @@ const MAX_VIDEOS = 500; // safety cap per job
 
 function apiKey(): string {
   const key = process.env.YOUTUBE_API_KEY;
-  if (!key) throw new Error('YOUTUBE_API_KEY is not set');
+  if (!key) throw new Error(
+    'YOUTUBE_API_KEY is not set. Add it to .env.local: YOUTUBE_API_KEY=your_key_here'
+  );
   return key;
 }
 
@@ -40,8 +42,12 @@ async function fetchPlaylistVideos(
 
     const res = await fetch(`${YT_API_BASE}/playlistItems?${params}`);
     if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err?.error?.message ?? `YouTube API error: ${res.status}`);
+      let errMsg = `YouTube API error: ${res.status}`;
+      try {
+        const err = await res.json();
+        errMsg = err?.error?.message ?? errMsg;
+      } catch { /* ignore JSON parse failure */ }
+      throw new Error(errMsg);
     }
     const data = await res.json();
 
@@ -76,7 +82,10 @@ async function fetchVideoDetails(
     });
 
     const res = await fetch(`${YT_API_BASE}/videos?${params}`);
-    if (!res.ok) continue;
+    if (!res.ok) {
+      console.warn(`[discover] fetchVideoDetails batch ${i} failed with ${res.status}, skipping`);
+      continue;
+    }
     const data = await res.json();
 
     for (const item of data.items ?? []) {
@@ -181,15 +190,29 @@ export async function discoverVideos(
 
   // ─── Playlist ───
   if (type === 'playlist') {
-    // Get playlist metadata
+    // Get playlist metadata — with proper error handling
     const metaParams = new URLSearchParams({
       part: 'snippet',
       id: rawId,
       key: apiKey(),
     });
     const metaRes = await fetch(`${YT_API_BASE}/playlists?${metaParams}`);
+    if (!metaRes.ok) {
+      let errMsg = `YouTube API error fetching playlist metadata: ${metaRes.status}`;
+      try {
+        const errBody = await metaRes.json();
+        errMsg = errBody?.error?.message ?? errMsg;
+      } catch { /* ignore */ }
+      throw new Error(errMsg);
+    }
     const metaData = await metaRes.json();
-    const playlistTitle = metaData.items?.[0]?.snippet?.title ?? 'Playlist';
+    if (!metaData.items || metaData.items.length === 0) {
+      throw new Error(
+        `Playlist not found or is private (id: ${rawId}). ` +
+        'Make sure the playlist is public and the ID in the URL is correct.'
+      );
+    }
+    const playlistTitle = metaData.items[0]?.snippet?.title ?? 'Playlist';
 
     const { videoIds, titles } = await fetchPlaylistVideos(rawId);
     if (videoIds.length === 0) throw new Error('Playlist is empty or all videos are private.');
